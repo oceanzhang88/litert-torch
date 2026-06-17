@@ -23,12 +23,24 @@ from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_expor
 from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
 import transformers
 
+try:
+  from litert_torch_ext.locateanything import registry as locateanything_registry
+except ImportError:
+  locateanything_registry = None
+
 
 def get_prefill_decode_exportables(
     model_config: transformers.PretrainedConfig,
     export_config: exportable_module.ExportableModuleConfig,
 ):
   """Gets prefill-decode exportables."""
+  if locateanything_registry is not None:
+    locateanything_exportables = locateanything_registry.get_prefill_decode_exportables(
+        model_config, export_config
+    )
+    if locateanything_exportables:
+      print('Using LocateAnything exportables.')
+      return locateanything_exportables
   if model_config.model_type == 'gemma3n':
     assert (
         not export_config.split_cache
@@ -68,6 +80,13 @@ def get_vision_exportables(
     model_config: transformers.PretrainedConfig,
 ):
   """Gets vision exportables."""
+  if locateanything_registry is not None:
+    locateanything_exportables = locateanything_registry.get_vision_exportables(
+        model_config
+    )
+    if locateanything_exportables:
+      print('Using LocateAnything vision exportables.')
+      return locateanything_exportables
   if model_config.model_type == 'gemma3':
     return (
         gemma3_vision_exportable.LiteRTExportableModuleForGemma3VisionEncoder,

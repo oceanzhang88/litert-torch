@@ -18,11 +18,22 @@ from litert_torch.generative.export_hf.model_ext.gemma3 import metadata_builder 
 from litert_torch.generative.export_hf.model_ext.gemma4 import metadata_builder as gemma4_metadata_builder
 import transformers
 
+try:
+  from litert_torch_ext.locateanything import registry as locateanything_registry
+except ImportError:
+  locateanything_registry = None
+
 
 def get_metadata_builder(
     model_config: transformers.PretrainedConfig,
 ):
   """Gets metadata builder."""
+  if locateanything_registry is not None:
+    locateanything_builder = locateanything_registry.get_metadata_builder(
+        model_config
+    )
+    if locateanything_builder:
+      return locateanything_builder
   if model_config.model_type == 'gemma3':
     return gemma3_metadata_builder.build_llm_metadata
   elif model_config.model_type == 'gemma3n':

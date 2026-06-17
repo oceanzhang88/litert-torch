@@ -41,6 +41,11 @@ from litert_torch.generative.export_hf.core.split_cache import exportable_module
 from litert_torch.generative.export_hf.model_ext import exportables as model_ext_exportables
 from litert_torch.generative.export_hf.model_ext import extension as model_ext_extension
 from litert_torch.generative.export_hf.model_ext import patches as model_ext_patches
+
+try:
+  from litert_torch_ext.locateanything import registry as locateanything_registry
+except ImportError:
+  locateanything_registry = None
 from litert_torch.generative.tools import tokenizer_to_sentencepiece_lib as tokenizer_lib
 import torch
 import transformers
@@ -162,7 +167,21 @@ def load_model(
       dtype=torch.float32,
       trust_remote_code=trust_remote_code,
   )
-  config._attn_implementation = 'lrt_transposed_attention'  # pylint: disable=protected-access
+  if (
+      locateanything_registry is not None
+      and locateanything_registry.is_locateanything_config(config)
+  ):
+    # LocateAnything vendors a custom Qwen2 implementation whose local
+    # QWEN2_ATTENTION_CLASSES registry does not know LiteRT's
+    # `lrt_transposed_attention` key during construction. Load the source model
+    # with its supported SDPA path first; the export phase still calls
+    # `set_attn_implementation("lrt_transposed_attention")` and will surface the
+    # next true optimized-attention boundary if the custom model cannot adopt it.
+    config._attn_implementation = 'sdpa'  # pylint: disable=protected-access
+    if hasattr(config, 'text_config'):
+      config.text_config._attn_implementation = 'sdpa'  # pylint: disable=protected-access
+  else:
+    config._attn_implementation = 'lrt_transposed_attention'  # pylint: disable=protected-access
 
   if task == ExportTask.TEXT_GENERATION:
     auto_model_cls = transformers.AutoModelForCausalLM
@@ -170,6 +189,10 @@ def load_model(
     auto_model_cls = transformers.AutoModelForImageTextToText
   else:
     raise ValueError(f'Unsupported task: {task}')
+  if locateanything_registry is not None:
+    auto_model_name = locateanything_registry.required_loader_auto_model(config)
+    if auto_model_name:
+      auto_model_cls = getattr(transformers, auto_model_name)
   if auto_model_override is not None:
     auto_model_cls = transformers.__dict__[auto_model_override]
 
@@ -197,13 +220,15 @@ def load_model(
 
   if task == ExportTask.IMAGE_TEXT_TO_TEXT:
     image_processor = transformers.AutoImageProcessor.from_pretrained(
-        model_path
+        model_path, trust_remote_code=trust_remote_code
     )
   else:
     image_processor = None
 
   # TODO(weiyiw): Refactor into a separate function.
-  tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+  tokenizer = transformers.AutoTokenizer.from_pretrained(
+      model_path, trust_remote_code=trust_remote_code
+  )
   if not hasattr(tokenizer, 'chat_template') or not tokenizer.chat_template:
     try:
       if utils.get_model_path_type(model_path) == 'repo_id':
