@@ -16,6 +16,7 @@
 
 from typing import Any
 
+from litert_torch.generative.export_hf.core import utils
 import torch
 
 
@@ -39,14 +40,23 @@ class RotaryPositionEmbeddingInjector(torch.nn.Module):
 
 def inject_rotary_position_embedding(model):
   """Injects RotaryPositionEmbedding."""
-  try:
-    model.model.original_rotary_emb = model.model.rotary_emb
-    model.model.rotary_emb = RotaryPositionEmbeddingInjector(model.model.config)
-  except AttributeError:
-    model.model.language_model.original_rotary_emb = (
-        model.model.language_model.rotary_emb
+  decoder_model = utils.get_decoder_module(
+      model, "rotary_emb", allow_layers=True
+  )
+  if hasattr(decoder_model, "rotary_emb"):
+    decoder_model.original_rotary_emb = decoder_model.rotary_emb
+    decoder_model.rotary_emb = RotaryPositionEmbeddingInjector(
+        decoder_model.config
     )
-    model.model.language_model.rotary_emb = RotaryPositionEmbeddingInjector(
-        model.model.language_model.config
-    )
+    return model
+
+  first_rotary_emb = None
+  shared_rotary_emb = RotaryPositionEmbeddingInjector(decoder_model.config)
+  for decoder_layer in decoder_model.layers:
+    attention = decoder_layer.self_attn
+    if first_rotary_emb is None:
+      first_rotary_emb = attention.rotary_emb
+    attention.rotary_emb = shared_rotary_emb
+  decoder_model.original_rotary_emb = first_rotary_emb
+  decoder_model.rotary_emb = shared_rotary_emb
   return model

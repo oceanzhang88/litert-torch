@@ -82,10 +82,9 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
         'use_cache': True,
     })
 
-    language_model = self.model.model
-    if hasattr(self.model.model, 'language_model'):
-      language_model = self.model.model.language_model
-
+    language_model = utils.get_decoder_module(
+        self.model, 'original_rotary_emb'
+    )
     assert language_model.original_rotary_emb is not None
     language_model.rotary_emb.data = (
         pos_emb_cos.permute(0, 2, 1, 3).squeeze(0),
@@ -118,7 +117,7 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLM(
 
   def _get_input(self, batch_size, input_length, cache_length):
 
-    model_config = self.model.model.config
+    model_config = utils.get_decoder_module(self.model, 'config').config
     if hasattr(model_config, 'text_config'):
       model_config = model_config.text_config
     embed_size_per_head = (

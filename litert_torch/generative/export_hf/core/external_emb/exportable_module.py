@@ -135,7 +135,16 @@ class LiteRTExportableModuleForEmbedder(torch.nn.Module):
     tokens = {"token_ids": torch.ones((batch_size, 1), dtype=torch.int32)}
     tokens_dynamic_shape = {"token_ids": {1: 1}} if prefill_length_dim else {}
     if export_config.single_token_embedder:
-      return {"embedder": (tokens, tokens_dynamic_shape)}
+      # LiteRT-LM's CPU/GPU executor accepts the first/default single-token
+      # embedder signature, but the NPU multimodal path asks for
+      # `decode_embedder` explicitly when it creates the text embedding lookup
+      # manager. Keep the generic signature for existing package consumers and
+      # add the NPU decode alias so image-text packages can run all-NPU without
+      # changing runtime semantics.
+      return {
+          "embedder": (tokens, tokens_dynamic_shape),
+          "decode_embedder": (tokens, tokens_dynamic_shape),
+      }
     else:
       ret = {}
       ret["decode_embedder"] = (tokens, tokens_dynamic_shape)

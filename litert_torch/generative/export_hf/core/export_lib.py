@@ -509,8 +509,9 @@ def export_vision_encoder_models(
   model_config = source_model_artifacts.model_config
   tokenizer = source_model_artifacts.tokenizer
   quantization_recipe = (
-      export_config.vision_encoder_quantization_recipe
-      or export_config.quantization_recipe
+      export_config.quantization_recipe
+      if export_config.vision_encoder_quantization_recipe is None
+      else export_config.vision_encoder_quantization_recipe
   )
   work_dir = export_config.work_dir
 

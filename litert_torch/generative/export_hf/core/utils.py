@@ -93,7 +93,46 @@ def has_local_rope(model):
   config = model.config
   if hasattr(config, 'text_config'):
     config = config.text_config
-  return 'sliding_attention' in config.rope_parameters
+  return 'sliding_attention' in getattr(config, 'rope_parameters', {})
+
+
+def get_decoder_module(model, attr_name=None, allow_layers=False):
+  """Returns the decoder module across common HF wrapper shapes.
+
+  Multimodal wrappers can place the text decoder at ``model.model``,
+  ``model.model.language_model``, or ``model.language_model.model``. Keep this
+  lookup shared so preprocessing, exportable modules, and split-cache runtime
+  inputs agree on the same decoder owner.
+  """
+  candidates = []
+  for path in (
+      ('model',),
+      ('model', 'language_model'),
+      ('language_model', 'model'),
+      ('language_model',),
+      (),
+  ):
+    candidate = model
+    for attr in path:
+      if not hasattr(candidate, attr):
+        candidate = None
+        break
+      candidate = getattr(candidate, attr)
+    if candidate is not None and all(candidate is not x for x in candidates):
+      candidates.append(candidate)
+
+  if attr_name is None:
+    return candidates[0]
+  for candidate in candidates:
+    if hasattr(candidate, attr_name):
+      return candidate
+  if allow_layers:
+    for candidate in candidates:
+      if hasattr(candidate, 'layers'):
+        return candidate
+  raise AttributeError(
+      f'Could not find decoder module with {attr_name} on model wrapper.'
+  )
 
 
 def has_sliding_attention(model):
