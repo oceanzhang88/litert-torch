@@ -91,6 +91,12 @@ _BACKEND = flags.DEFINE_enum(
     'Hardware backend to use for LiteRT LM.',
 )
 
+_LITERT_LM_MODEL_PATH = flags.DEFINE_string(
+    'litert_lm_model_path',
+    '',
+    'Path to a LiteRT LM model to validate. If specified, the model will be'
+    ' used instead of exporting from Hugging Face.',
+)
 
 def run_transformers(
     model_id: str, prompts: list[str], max_new_tokens: int
@@ -115,7 +121,11 @@ def run_transformers(
       history_str += prompt
       formatted_prompt = history_str
 
-    inputs = tokenizer(formatted_prompt, return_tensors='pt')
+    inputs = tokenizer(
+        formatted_prompt,
+        return_tensors='pt',
+        add_special_tokens=not has_template,
+    )
     with torch.no_grad():
       outputs = model.generate(
           **inputs,
@@ -198,18 +208,21 @@ def main(argv):
 
   try:
     # Export model
-    litert_torch_export.export(
-        model=model_id,
-        output_dir=export_dir,
-        quantization_recipe='',  # Disable quantization
-        bundle_litert_lm=True,
-        cache_length=_MAX_NUM_TOKENS.value,
-        externalize_embedder=_EXTERNALIZE_EMBEDDER.value,
-        single_token_embedder=_SINGLE_TOKEN_EMBEDDER.value,
-        split_cache=_SPLIT_CACHE.value,
-    )
+    if not _LITERT_LM_MODEL_PATH.value:
+      litert_torch_export.export(
+          model=model_id,
+          output_dir=export_dir,
+          quantization_recipe='',  # Disable quantization
+          bundle_litert_lm=True,
+          cache_length=_MAX_NUM_TOKENS.value,
+          externalize_embedder=_EXTERNALIZE_EMBEDDER.value,
+          single_token_embedder=_SINGLE_TOKEN_EMBEDDER.value,
+          split_cache=_SPLIT_CACHE.value,
+      )
 
-    exported_model_path = os.path.join(export_dir, 'model.litertlm')
+      exported_model_path = os.path.join(export_dir, 'model.litertlm')
+    else:
+      exported_model_path = _LITERT_LM_MODEL_PATH.value
     if not os.path.exists(exported_model_path):
       raise FileNotFoundError(
           f'Exported model not found at {exported_model_path}'

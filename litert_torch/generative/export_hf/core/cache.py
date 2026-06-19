@@ -33,6 +33,7 @@ from litert_torch.generative.export_hf.core import exportable_module_config
 import litert_torch.generative.export_hf.core.cache_base as cache_base_lib
 import torch
 import torch.utils._pytree as pytree
+from transformers import cache_utils
 
 ExportableModuleConfig = exportable_module_config.ExportableModuleConfig
 
@@ -69,7 +70,7 @@ def _get_slice_indices(
   assert ts_idx < cache_dim, "ts_idx must be less than cache_dim."
   assert ts_idx >= 0, "ts_idx must be greater than or equal to 0."
 
-  zeros = torch.zeros((1,), dtype=torch.int32)
+  zeros = torch.zeros((1,), dtype=positions.dtype)
   indices = []
   for i in range(cache_dim):
     if i == ts_idx:
@@ -318,6 +319,131 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     )
 
 
+class LiteRTLMConvCacheLayer(
+    cache_base_lib.LiteRTLMCacheLayerMixin,
+    cache_utils.LinearAttentionCacheLayerMixin,
+):
+  """Optimized Conv Cache layer class for HuggingFace integration."""
+
+  is_compileable = True
+  is_sliding = False
+
+  def __init__(
+      self,
+      conv_states: torch.Tensor,
+      batch_size: int = 1,
+      **kwargs,
+  ):
+    cache_utils.LinearAttentionCacheLayerMixin.__init__(self)
+    self.conv_states = conv_states
+    self.is_conv_states_initialized = True
+    self.batch_size = batch_size
+    self.is_initialized = True
+    self.conv_kernel_size = conv_states.shape[-1]
+    self.keys = torch.zeros((1, 1, 1, 1))
+    self.values = torch.zeros((1, 1, 1, 1))
+
+  def get_batch_size(self) -> int:
+    return self.batch_size
+
+  def get_k_ts_idx(self) -> int:
+    # Not used.
+    return 2
+
+  def get_v_ts_idx(self) -> int:
+    # Not used.
+    return 3
+
+  def lazy_initialization(self, *args, **kwargs):
+    raise NotImplementedError("Lazy initialization is not supported.")
+
+  def update(self, key_states, value_states, *args, **kwargs):
+    raise ValueError("Cannot call update on ConvCacheLayer.")
+
+  def update_conv_state(
+      self,
+      conv_states: torch.Tensor,
+      **kwargs) -> torch.Tensor:
+    seq_len = conv_states.shape[-1]
+    cache_kwargs = self.get_cache_runtime_args()
+    cache_position = cache_kwargs.get("cache_position", None)
+    valid_mask = kwargs.get("valid_mask", None)
+
+    if valid_mask is None and cache_position is not None:
+      if seq_len > 1:
+        valid_mask = torch.ones_like(cache_position, dtype=torch.bool)
+        valid_mask[1:] = cache_position[1:] > cache_position[:-1]
+
+    if valid_mask is not None:
+      if valid_mask.dim() == 1:
+        mask = valid_mask.unsqueeze(0).unsqueeze(0)
+      else:
+        mask = valid_mask.unsqueeze(1)
+      conv_states = conv_states * mask
+
+    padded_input = torch.cat([self.conv_states, conv_states], dim=-1)
+
+    if seq_len > 1:
+      if valid_mask is not None:
+        L_state = self.conv_kernel_size
+        num_real = valid_mask.sum()
+        start = num_real
+        idx = torch.arange(L_state, device=conv_states.device) + start
+        next_state = padded_input[:, :, idx]
+      else:
+        next_state = padded_input[:, :, -self.conv_kernel_size:]
+    else:
+      next_state = padded_input[:, :, -self.conv_kernel_size:]
+
+    self.conv_states.copy_(next_state)
+    return self.conv_states
+
+  def update_recurrent_state(
+      self, recurrent_states: torch.Tensor, **kwargs
+  ) -> torch.Tensor:
+    raise NotImplementedError(
+        "Recurrent state is not supported in LiteRTLMConvCacheLayer."
+    )
+
+  def get_mask_sizes(self, cache_position: torch.Tensor):
+    return self.conv_kernel_size, 0
+
+  def get_seq_length(self) -> int:
+    return 0
+
+  def get_max_cache_shape(self) -> int:
+    return self.conv_kernel_size
+
+  @classmethod
+  def create_from_config(
+      cls,
+      model_config,
+      layer_index,
+      export_config: ExportableModuleConfig,
+      **kwargs,
+  ) -> "LiteRTLMConvCacheLayer":
+    assert model_config.layer_types[layer_index] == "conv"
+    c_state_shape = (
+        export_config.batch_size,
+        model_config.hidden_size,
+        model_config.conv_L_cache - 1,
+    )
+    c_state = torch.zeros(c_state_shape, dtype=torch.float32)
+    batch_size = kwargs.pop("batch_size", export_config.batch_size)
+    return cls(
+        c_state,
+        batch_size=batch_size,
+        **kwargs,
+    )
+
+
+LAYER_TYPE_TO_CLASS = {
+    "full_attention": LiteRTLMCacheLayer,
+    "sliding_attention": LiteRTLMCacheLayer,
+    "conv": LiteRTLMConvCacheLayer,
+}
+
+
 @cache_base_lib.register_cache_implementation
 class LiteRTLMCache(cache_base_lib.LiteRTLMCacheMixin):
   """Optimized Cache class for HuggingFace integration."""
@@ -334,8 +460,12 @@ class LiteRTLMCache(cache_base_lib.LiteRTLMCacheMixin):
     num_shared_layers = getattr(model_config, "num_kv_shared_layers", 0)
     layers = []
     for layer_index in range(num_layers - num_shared_layers):
+      layer_type = "full_attention"
+      if hasattr(model_config, "layer_types"):
+        layer_type = model_config.layer_types[layer_index]
+      layer_class = LAYER_TYPE_TO_CLASS.get(layer_type, LiteRTLMCacheLayer)
       layers.append(
-          LiteRTLMCacheLayer.create_from_config(
+          layer_class.create_from_config(
               model_config,
               layer_index,
               export_config,
@@ -364,44 +494,81 @@ class LiteRTLMCache(cache_base_lib.LiteRTLMCacheMixin):
 
 def _flatten_kvc_t(
     kvc: LiteRTLMCache,
-) -> Tuple[List[torch.Tensor], Tuple[List[str], Tuple[int, int, int, int]]]:
+) -> Tuple[
+    List[torch.Tensor], Tuple[List[str], Tuple[int, int, int, int, List[str]]]
+]:
   """Flattens the cache into a list of tensors."""
   flattened = []
   flat_names = []
   num_layers = len(kvc.layers)
-  layer_0 = kvc.layers[0]
-  assert isinstance(layer_0, cache_base_lib.LiteRTLMCacheLayerMixin)
-  batch_size = layer_0.get_batch_size()
-  k_ts_idx = layer_0.get_k_ts_idx()
-  v_ts_idx = layer_0.get_v_ts_idx()
+  attention_layer = None
+  for layer in kvc.layers:
+    if isinstance(layer, LiteRTLMCacheLayer):
+      attention_layer = layer
+      break
+
+  if attention_layer is not None:
+    batch_size = attention_layer.get_batch_size()
+    k_ts_idx = attention_layer.get_k_ts_idx()
+    v_ts_idx = attention_layer.get_v_ts_idx()
+  else:
+    layer_0 = kvc.layers[0]
+    assert isinstance(layer_0, cache_base_lib.LiteRTLMCacheLayerMixin)
+    batch_size = layer_0.get_batch_size()
+    k_ts_idx = layer_0.get_k_ts_idx()
+    v_ts_idx = layer_0.get_v_ts_idx()
+  layer_types = []
   for i, layer in enumerate(kvc.layers):
-    flattened.append(layer.keys)
-    flat_names.append(f"k_{i}")
-    flattened.append(layer.values)
-    flat_names.append(f"v_{i}")
-  return flattened, (flat_names, (batch_size, num_layers, k_ts_idx, v_ts_idx))
+    if isinstance(layer, LiteRTLMConvCacheLayer):
+      layer_types.append("conv")
+      flattened.append(layer.conv_states)
+      flat_names.append(f"c_{i}")
+    elif isinstance(layer, LiteRTLMCacheLayer):
+      layer_types.append("full_attention")
+      flattened.append(layer.keys)
+      flat_names.append(f"k_{i}")
+      flattened.append(layer.values)
+      flat_names.append(f"v_{i}")
+    else:
+      raise ValueError(f"Unsupported layer type: {type(layer)}")
+  return (
+      flattened,
+      (flat_names, (batch_size, num_layers, k_ts_idx, v_ts_idx, layer_types)),
+  )
 
 
 def _unflatten_kvc_t(
     values: List[torch.Tensor],
-    context: Tuple[List[str], Tuple[int, int, int, int]],
+    context: Tuple[List[str], Tuple[int, int, int, int, List[str]]],
 ) -> LiteRTLMCache:
   """Unflattens the cache from a list of tensors."""
   flat_names = context[0]
-  batch_size, num_layers, k_ts_idx, v_ts_idx = context[1]
+  batch_size, num_layers, k_ts_idx, v_ts_idx, layer_types = context[1]
   layers = []
   for i in range(num_layers):
-    k_cache_idx = flat_names.index(f"k_{i}")
-    v_cache_idx = flat_names.index(f"v_{i}")
-    layers.append(
-        LiteRTLMCacheLayer(
-            key_cache=values[k_cache_idx],
-            value_cache=values[v_cache_idx],
-            batch_size=batch_size,
-            k_ts_idx=k_ts_idx,
-            v_ts_idx=v_ts_idx,
-        )
-    )
+    layer_type = layer_types[i]
+    if layer_type == "conv":
+      c_cache_idx = flat_names.index(f"c_{i}")
+      layers.append(
+          LiteRTLMConvCacheLayer(
+              conv_states=values[c_cache_idx],
+              batch_size=batch_size,
+          )
+      )
+    elif layer_type == "full_attention":
+      k_cache_idx = flat_names.index(f"k_{i}")
+      v_cache_idx = flat_names.index(f"v_{i}")
+      layers.append(
+          LiteRTLMCacheLayer(
+              key_cache=values[k_cache_idx],
+              value_cache=values[v_cache_idx],
+              batch_size=batch_size,
+              k_ts_idx=k_ts_idx,
+              v_ts_idx=v_ts_idx,
+          )
+      )
+    else:
+      raise ValueError(f"Unsupported layer type: {layer_type}")
   obj = LiteRTLMCache(layers)
   return obj
 

@@ -111,6 +111,26 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
     else:
       ret["input_ids"] = tokens
 
+    valid_mask = None
+    if tokens is not None:
+      pad_token_id = getattr(text_config, "pad_token_id", 0)
+      if pad_token_id is None:
+        pad_token_id = 0
+      valid_mask = tokens != pad_token_id
+    elif input_pos is not None:
+      valid_mask_0 = torch.ones_like(input_pos[:1], dtype=torch.bool).unsqueeze(
+          0
+      )
+      if input_pos.shape[0] > 1:
+        valid_mask_1 = input_pos[1:] > input_pos[:-1]
+      else:
+        valid_mask_1 = torch.ones_like(input_pos[1:], dtype=torch.bool)
+      valid_mask_1 = valid_mask_1.unsqueeze(0)
+      valid_mask = torch.cat([valid_mask_0, valid_mask_1], dim=1)
+
+    if valid_mask is not None:
+      ret["valid_mask"] = valid_mask
+
     cache_runtime_args = {"cache_position": input_pos}
     kv_cache.set_cache_runtime_args(cache_runtime_args)
 
@@ -138,21 +158,22 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
     )
     inputs = {"kv_cache": kv_cache}
     if export_config.cache_length_dim is not None:
-      all_k_shapes = tuple(
-          {2: export_config.cache_length_dim} for _ in range(num_layers)
-      )
-      all_v_shapes = tuple(
-          {3: export_config.cache_length_dim} for _ in range(num_layers)
-      )
-      dynamic_shapes = {
-          "kv_cache": {
-              "k": all_k_shapes,
-              "v": all_v_shapes,
-          }
-      }
+      flat_shapes = []
+      for layer in kv_cache.layers:
+        if hasattr(layer, "conv_state"):
+          flat_shapes.append(None)
+        else:
+          k_ts_idx = getattr(layer, "k_ts_idx")
+          v_ts_idx = getattr(layer, "v_ts_idx")
+          flat_shapes.append({k_ts_idx: export_config.cache_length_dim})
+          flat_shapes.append({v_ts_idx: export_config.cache_length_dim})
+      dynamic_shapes = {"kv_cache": flat_shapes}
       return inputs, dynamic_shapes
     else:
-      return inputs, {}
+      import torch.utils._pytree as pytree  # pylint: disable=g-import-not-at-top
+
+      flat_tensors, _ = pytree.tree_flatten(kv_cache)
+      return inputs, {"kv_cache": [None] * len(flat_tensors)}
 
 
 class LiteRTExportableModuleForDecoderOnlyLMPrefill(
@@ -231,7 +252,7 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
             "input_pos": {0: export_config.prefill_length_dim},
         }
         dynamic_shapes.update(kv_cache_dynamic_shapes)
-        sample_inputs[f"prefill_{prefill_length}"] = (inputs, dynamic_shapes)
+        sample_inputs["prefill"] = (inputs, dynamic_shapes)
       else:
         sample_inputs[f"prefill_{prefill_length}"] = (inputs, {})
     return sample_inputs

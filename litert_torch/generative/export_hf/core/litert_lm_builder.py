@@ -121,24 +121,42 @@ def build_llm_metadata(
     else:
       llm_metadata.start_token.token_str = str(tokenizer.bos_token)
 
+  stop_tokens = set()
   gen_config = getattr(model, 'generation_config', None)
+  has_eos_token_id = False
   if gen_config:
-    stop_tokens = set()
     if hasattr(gen_config, 'eos_token_id'):
+      has_eos_token_id = True
       if isinstance(gen_config.eos_token_id, int):
         stop_tokens.add(gen_config.eos_token_id)
       elif isinstance(gen_config.eos_token_id, list):
         for token_id in gen_config.eos_token_id:
           stop_tokens.add(token_id)
-    elif hasattr(tokenizer, 'eos_token') and tokenizer.eos_token:
-      stop_tokens.add(tokenizer.eos_token)
-    for stop_token in stop_tokens:
-      if isinstance(stop_token, int):
-        tu = llm_metadata.stop_tokens.add()
-        tu.token_ids.ids.append(stop_token)
-      elif isinstance(stop_token, str):
-        tu = llm_metadata.stop_tokens.add()
-        tu.token_str = stop_token
+  if (
+      not has_eos_token_id
+      and hasattr(tokenizer, 'eos_token')
+      and tokenizer.eos_token
+  ):
+    stop_tokens.add(tokenizer.eos_token)
+
+  if isinstance(chat_templates, tuple):
+    _, _, model_prompt_parts = chat_templates
+    if model_prompt_parts[1]:
+      stop_tokens.add(model_prompt_parts[1])
+  else:
+    parsed_templates = parse_chat_template(tokenizer)
+    if parsed_templates is not None:
+      _, _, model_prompt_parts = parsed_templates
+      if model_prompt_parts[1]:
+        stop_tokens.add(model_prompt_parts[1])
+
+  for stop_token in stop_tokens:
+    if isinstance(stop_token, int):
+      tu = llm_metadata.stop_tokens.add()
+      tu.token_ids.ids.append(stop_token)
+    elif isinstance(stop_token, str):
+      tu = llm_metadata.stop_tokens.add()
+      tu.token_str = stop_token
 
     if gen_config and gen_config.do_sample:
       sampler_params = llm_metadata.sampler_params

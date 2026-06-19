@@ -25,12 +25,4 @@ def update_export_config(
     model_config: transformers.PretrainedConfig,
 ) -> exportable_module.ExportableModuleConfig:
   """Updates export config."""
-  match model_config.model_type:
-    case 'lfm2':
-      if export_config.split_cache:
-        raise ValueError('Split cache is not supported for LFM2.')
-      return dataclasses.replace(
-          export_config, cache_implementation='LiteRTLFM2Cache'
-      )
-    case _:
-      return export_config
+  return export_config
