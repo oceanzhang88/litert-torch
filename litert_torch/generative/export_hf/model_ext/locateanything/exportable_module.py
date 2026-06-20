@@ -32,7 +32,7 @@ def _export_safe_no_prefix_drop(position_ids: torch.Tensor) -> torch.Tensor:
     """Torch-export-safe replacement for LocateAnything's prefix drop detector."""
 
     batch_size = position_ids.shape[0]
-    return torch.full((batch_size,), -1, dtype=torch.long, device=position_ids.device)
+    return torch.full((batch_size,), -1, dtype=torch.int32, device=position_ids.device)
 
 
 def _patch_export_safe_prefix_helper(language_model: torch.nn.Module) -> None:
@@ -51,6 +51,25 @@ def _drop_locateanything_unsupported_inputs(inputs: dict) -> dict:
     inputs.pop("k_ts_idx", None)
     inputs.pop("v_ts_idx", None)
     inputs.pop("valid_mask", None)
+    return inputs
+
+
+def _flatten_full_attention_mask(inputs: dict) -> dict:
+    """Unwrap a single-key {'full_attention': mask} dict to the bare tensor.
+
+    adapt_inputs in the shared core builds ``masks`` as a dict when
+    ``need_sliding_mask`` is False (the common Qwen2.5 case where
+    sliding_window == seq_length).  That dict propagates as
+    ``attention_mask`` and breaks the 4D-tensor fast path in
+    ``_export_safe_prepare_attention_mask`` whose ``len(attention_mask.shape)``
+    guard cannot match a dict, so the mask falls through to the slow
+    vendored ``_prepare_4d_causal_attention_mask`` and the const-tensor
+    LESS/ADD/SELECT ops survive into the flatbuffer.  This helper unwraps
+    the dict before the model call; the tensor inside is unchanged.
+    """
+    m = inputs.get("attention_mask")
+    if isinstance(m, dict) and len(m) == 1:
+        inputs["attention_mask"] = next(iter(m.values()))
     return inputs
 
 
@@ -328,12 +347,12 @@ def _export_safe_qwen2_model_forward(
         position_ids = torch.arange(
             past_key_values_length,
             seq_length + past_key_values_length,
-            dtype=torch.long,
+            dtype=torch.int32,
             device=device,
         )
         position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
     else:
-        position_ids = position_ids.view(-1, seq_length).long()
+        position_ids = position_ids.view(-1, seq_length)
 
     if inputs_embeds is None:
         inputs_embeds = self.image_processing(input_ids, visual_features, image_token_index)
@@ -408,6 +427,10 @@ def _patch_export_safe_language_model(
         attention.export_k_ts_idx = export_config.k_ts_idx
         attention.export_v_ts_idx = export_config.v_ts_idx
         attention.forward = MethodType(attention_forward, attention)
+    assert all(
+        getattr(l.self_attn.forward, "__func__", None) is attention_forward
+        for l in qwen_model.layers
+    ), "LocateAnything export: a decoder layer escaped the export-safe attention patch"
 
 
 class LiteRTExportableModuleForLocateAnythingPrefillExternalEmbedder(
@@ -433,6 +456,7 @@ class LiteRTExportableModuleForLocateAnythingPrefillExternalEmbedder(
         )
         inputs |= self.attention_kwargs()
         inputs = _drop_locateanything_unsupported_inputs(inputs)
+        inputs = _flatten_full_attention_mask(inputs)
         output = self.model(**inputs)
         return {"kv_cache": output.past_key_values}
 
@@ -460,6 +484,7 @@ class LiteRTExportableModuleForLocateAnythingGenerateExternalEmbedder(
         )
         inputs |= self.attention_kwargs()
         inputs = _drop_locateanything_unsupported_inputs(inputs)
+        inputs = _flatten_full_attention_mask(inputs)
         output = self.model(**inputs)
         return {"kv_cache": output.past_key_values, "logits": output.logits}
 
