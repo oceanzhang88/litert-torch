@@ -66,6 +66,9 @@ def _optimization_barrier_fake(inputs: tuple[torch.Tensor, ...]):
 @registry.lower(torch.ops.litert_torch.optimization_barrier.default)
 def _optimization_barrier_lowering(
     lctx, inputs: tuple[ir.Value, ...]
-) -> ir.Value:
+) -> tuple[ir.Value, ...] | ir.Value:
   del lctx
-  return stablehlo.optimization_barrier(inputs)
+  barrier = stablehlo.optimization_barrier(inputs)
+  if len(inputs) == 1:
+    return (barrier,)
+  return barrier

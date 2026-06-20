@@ -52,6 +52,25 @@ class TestOptimizationBarrier(googletest.TestCase):
     self.assertIsInstance(y, torch.Tensor)
     self.assertEqual(y.shape, (1, 5))
 
+  def test_lower_single_tensor_barrier(self):
+    """Test single tensor barrier lowering keeps exported getitem valid."""
+
+    class TestModel(torch.nn.Module):
+
+      def forward(self, x):
+        return optimization_barrier(x)
+
+    x = torch.randn(1, 5)
+    ep = torch.export.export(TestModel().eval(), (x,))
+    mlir = backend.export.exported_program_to_mlir(ep)
+    mlir_text = mlir.get_text()
+    self.assertEqual(
+        mlir_text.count(
+            "stablehlo.optimization_barrier %arg0 : tensor<1x5xf32>"
+        ),
+        1,
+    )
+
   def test_input_multiple_tensors(self):
     """Test optimization barrier with multiple tensors input."""
     x = torch.randn(1, 5)

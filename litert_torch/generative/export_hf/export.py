@@ -104,6 +104,7 @@ def export(
     aot_soc_model: str | None = None,
     aot_compilation_config_dict: dict[str, Any] | None = None,
     experimental_lightweight_conversion: bool = False,
+    experimental_runtime_constant_folding: bool | None = None,
     # pylint: enable=unused-argument
     **kwargs,
 ):
@@ -136,6 +137,11 @@ def export(
       vision encoder.
     litert_lm_model_type_override: Overriding the LiteRT LM model type.
     litert_lm_llm_metadata_override: Overriding the LiteRT LM LLM metadata.
+    experimental_lightweight_conversion: Whether to use the LiteRT-Torch
+      lightweight conversion path.
+    experimental_runtime_constant_folding: Whether to force LiteRT runtime
+      constant folding on/off during conversion. If unset, LiteRT-Torch keeps
+      its default behavior.
     **kwargs: Additional keyword arguments to pass to the exportable module
       config.
   """

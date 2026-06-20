@@ -65,6 +65,7 @@ class ExportableModuleConfig:
   jinja_chat_template_override: str | None = None
 
   experimental_lightweight_conversion: bool = False
+  experimental_runtime_constant_folding: bool | None = None
 
   # AOT Compilation.
   aot_backend: str | None = None

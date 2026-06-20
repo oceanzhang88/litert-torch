@@ -41,11 +41,7 @@ from litert_torch.generative.export_hf.core.split_cache import exportable_module
 from litert_torch.generative.export_hf.model_ext import exportables as model_ext_exportables
 from litert_torch.generative.export_hf.model_ext import extension as model_ext_extension
 from litert_torch.generative.export_hf.model_ext import patches as model_ext_patches
-
-try:
-  from litert_torch_ext.locateanything import registry as locateanything_registry
-except ImportError:
-  locateanything_registry = None
+from litert_torch.generative.export_hf.model_ext.locateanything import registry as locateanything_registry
 from litert_torch.generative.tools import tokenizer_to_sentencepiece_lib as tokenizer_lib
 import torch
 import transformers
@@ -168,8 +164,7 @@ def load_model(
       trust_remote_code=trust_remote_code,
   )
   if (
-      locateanything_registry is not None
-      and locateanything_registry.is_locateanything_config(config)
+      locateanything_registry.is_locateanything_config(config)
   ):
     # LocateAnything vendors a custom Qwen2 implementation whose local
     # QWEN2_ATTENTION_CLASSES registry does not know LiteRT's
@@ -189,10 +184,9 @@ def load_model(
     auto_model_cls = transformers.AutoModelForImageTextToText
   else:
     raise ValueError(f'Unsupported task: {task}')
-  if locateanything_registry is not None:
-    auto_model_name = locateanything_registry.required_loader_auto_model(config)
-    if auto_model_name:
-      auto_model_cls = getattr(transformers, auto_model_name)
+  auto_model_name = locateanything_registry.required_loader_auto_model(config)
+  if auto_model_name:
+    auto_model_cls = getattr(transformers, auto_model_name)
   if auto_model_override is not None:
     auto_model_cls = transformers.__dict__[auto_model_override]
 
@@ -390,6 +384,7 @@ def export_text_prefill_decode_model(
   with patch_builtin_tuple_for_export():
     lrt_model = converter.convert(
         lightweight_conversion=export_config.experimental_lightweight_conversion,
+        runtime_constant_folding=export_config.experimental_runtime_constant_folding,
         strict_export=False,
     )
 
@@ -481,6 +476,7 @@ def export_embedder_model(
     )
   lrt_model = converter.convert(
       lightweight_conversion=export_config.experimental_lightweight_conversion,
+      runtime_constant_folding=export_config.experimental_runtime_constant_folding,
       strict_export=False,
   )
   model_path = os.path.join(work_dir, 'embedder.tflite')
