@@ -135,10 +135,11 @@ class DecoderOnlyModel(nn.Module):
       export_config: Optional[export_cfg.ExportConfig] = None,
   ) -> dict[torch.Tensor, kv_utils.KVCache]:
     """Forwards the model with input embeddings."""
-    assert len(self.transformer_blocks) == len(kv_cache.caches), (
-        "The number of transformer blocks and the number of KV cache entries"
-        " must be the same."
-    )
+    if kv_cache is not None:
+      assert len(self.transformer_blocks) == len(kv_cache.caches), (
+          "The number of transformer blocks and the number of KV cache entries"
+          " must be the same."
+      )
 
     x = input_embeds
     if self.config.embedding_scale is not None:
@@ -148,7 +149,11 @@ class DecoderOnlyModel(nn.Module):
     for i, block in enumerate(self.transformer_blocks):
       kv_entry = kv_cache.caches[i] if kv_cache else None
       lora_adapter = lora.adapters[i] if lora else None
-      x, kv_entry = block(x, rope, mask, input_pos, kv_entry, lora_adapter)
+      block_out = block(x, rope, mask, input_pos, kv_entry, lora_adapter)
+      if isinstance(block_out, tuple):
+        x, kv_entry = block_out
+      else:
+        x, kv_entry = block_out, None
       if kv_entry:
         updated_kv_entries.append(kv_entry)
     updated_kv_cache = kv_utils.KVCache(tuple(updated_kv_entries))
