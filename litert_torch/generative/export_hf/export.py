@@ -85,6 +85,7 @@ def export(
     prefill_lengths: list[int] | None = None,
     cache_length: int | None = None,
     quantization_recipe: str | None = None,
+    calibration_data: Any | None = None,
     enable_dynamic_shape: bool | None = None,
     externalize_embedder: bool | None = None,
     single_token_embedder: bool | None = None,
@@ -124,6 +125,12 @@ def export(
     prefill_lengths: The lengths of the prefill input, separated by comma.
     cache_length: The length of the cache.
     quantization_recipe: The quantization recipes to use, separated by comma.
+    calibration_data: Optional calibration samples for quantization recipes
+      that require static-range (SRQ) activation calibration (e.g.
+      static_wi8_ai8), applied to the text prefill/decode model. See
+      litert_torch.generative.export_hf.calibration_data_lib
+      .build_calibration_data(). Ignored by recipes that don't need
+      calibration; if omitted for a recipe that does, export will raise.
     enable_dynamic_shape: Whether to enable dynamic shape.
     externalize_embedder: Whether to externalize the embedder.
     single_token_embedder: Whether to use a single token embedder.

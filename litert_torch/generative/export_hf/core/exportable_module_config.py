@@ -40,6 +40,17 @@ class ExportableModuleConfig:
   cache_length: int = 4096
   # For quantization
   quantization_recipe: str | None = "dynamic_wi8_afp32"
+  # Calibration samples for quantization recipes that require static-range
+  # (SRQ) activation calibration (e.g. static_wi8_ai8). Keyed by tflite
+  # signature name (e.g. "prefill_128", "decode"); each value is an
+  # iterable of {input_arg_name: np.ndarray} samples, matching the shape
+  # ai_edge_quantizer.quantizer.Quantizer.calibrate() expects. See
+  # calibration_data_lib.build_calibration_data() to construct this from a
+  # tokenizer + prompt strings. None (default) preserves prior behavior:
+  # recipes that don't need calibration are unaffected; recipes that do
+  # will raise in quantize_model() rather than silently quantizing
+  # uncalibrated.
+  calibration_data: Any | None = None
   # For dynamic shape
   enable_dynamic_shape: bool = False
   # Export configs

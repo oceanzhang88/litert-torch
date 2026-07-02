@@ -14,11 +14,13 @@
 # ==============================================================================
 """Export library for HF integration."""
 
+from collections.abc import Iterable
 import contextlib
 import dataclasses
 import gc
 import json
 import os
+from typing import Any
 
 import huggingface_hub
 from litert_torch import fx_infra
@@ -50,6 +52,13 @@ from ai_edge_litert.aot.core import aot_types
 from ai_edge_litert.aot.vendors import import_vendor
 from ai_edge_quantizer import quantizer as quantizer_lib
 from ai_edge_quantizer import recipe as recipe_lib
+
+# Calibration samples for a static-range (SRQ) quantization recipe: keyed by
+# tflite signature name (e.g. "prefill_128", "decode"), each value an
+# iterable of {input_arg_name: np.ndarray} samples -- the exact shape
+# ai_edge_quantizer.quantizer.Quantizer.calibrate() expects. See
+# litert_torch.generative.export_hf.calibration_data_lib.build_calibration_data().
+CalibrationData = dict[str, Iterable[dict[str, Any]]]
 
 
 @dataclasses.dataclass
@@ -278,6 +287,15 @@ def export_text_prefill_decode_model(
   model = source_model_artifacts.model
   text_model_config = source_model_artifacts.text_model_config
   quantization_recipe = export_config.quantization_recipe
+  # v1 scope (NPU campaign phase 7): only the text prefill/decode model
+  # reads calibration_data. export_config.calibration_data is not threaded
+  # into the embedder / vision encoder / auxiliary / adapter quantize call
+  # sites elsewhere in this file -- vision is a separate graph and out of
+  # scope for now (see calibration_data_lib module docstring). Those call
+  # sites are unaffected: they still pass calibration_data=None, which is
+  # safe -- a recipe that turned out to need calibration there would now
+  # raise a clear error instead of silently quantizing uncalibrated.
+  calibration_data = export_config.calibration_data
   work_dir = export_config.work_dir
   has_dynamic_shape = (
       export_config.cache_length_dim is not None
@@ -385,7 +403,9 @@ def export_text_prefill_decode_model(
       quantization_recipe.split(',') if quantization_recipe else [None]
   )
   for recipe in quantization_recipe_list:
-    model_path = maybe_quantize_model(model_path, recipe)
+    model_path = maybe_quantize_model(
+        model_path, recipe, calibration_data=calibration_data
+    )
     gc.collect()
 
   return dataclasses.replace(
@@ -397,19 +417,47 @@ def export_text_prefill_decode_model(
 def maybe_quantize_model(
     model_path: str,
     quantization_recipe: str | None = None,
+    calibration_data: CalibrationData | None = None,
 ):
   """Quantizes model if recipe is provided."""
   if not quantization_recipe:
     return model_path
-  return quantize_model(model_path, quantization_recipe)
+  return quantize_model(
+      model_path, quantization_recipe, calibration_data=calibration_data
+  )
 
 
 @progress.task('Quantize model')
 def quantize_model(
     model_path: str,
     quantization_recipe: str,
+    calibration_data: CalibrationData | None = None,
 ):
-  """Quantizes model."""
+  """Quantizes model.
+
+  Args:
+    model_path: Path to the float (or previously quantized) tflite model.
+    quantization_recipe: Name of a recipe function in ai_edge_quantizer.recipe
+      (e.g. 'dynamic_wi8_afp32', the default; or 'static_wi8_ai8', which
+      needs calibration -- static INT8xINT8 FULLY_CONNECTED is the form that
+      legalizes on HTP, per NPU campaign phase 5; the FP32xINT8 hybrid form
+      dynamic/weight-only recipes produce does not), or a path to a recipe
+      .json file.
+    calibration_data: Calibration samples keyed by tflite signature name,
+      required when the recipe needs static-range (SRQ) activation
+      calibration. See
+      litert_torch.generative.export_hf.calibration_data_lib
+      .build_calibration_data(). Ignored (may stay None) for recipes that
+      don't need calibration -- None there preserves prior (uncalibrated)
+      behavior byte-for-byte.
+
+  Returns:
+    Path to the quantized model.
+
+  Raises:
+    ValueError: If the recipe name/path is invalid, or if the recipe needs
+      calibration and no calibration_data was provided.
+  """
   quantized_model_path = (
       model_path.removesuffix('.tflite').removesuffix('_quantized')
       + '_quantized.tflite'
@@ -426,7 +474,23 @@ def quantize_model(
         f'Invalid quantization recipe: {quantization_recipe}. Please check'
         ' the recipe name.'
     ) from e
-  qt.quantize().export_model(quantized_model_path, overwrite=True)
+
+  calibration_result = None
+  if qt.need_calibration:
+    if not calibration_data:
+      raise ValueError(
+          f'Quantization recipe {quantization_recipe!r} requires'
+          ' static-range (SRQ) activation calibration but no'
+          ' calibration_data was provided. Pass calibration_data=... (see'
+          ' calibration_data_lib.build_calibration_data()) or choose a'
+          ' recipe that does not need calibration (e.g.'
+          ' dynamic_wi8_afp32, weight_only_wi8_afp32).'
+      )
+    calibration_result = qt.calibrate(calibration_data)
+
+  qt.quantize(calibration_result).export_model(
+      quantized_model_path, overwrite=True
+  )
   return quantized_model_path
 
 
