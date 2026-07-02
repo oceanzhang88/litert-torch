@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""calibration_data_lib.py -- v2.0.0
+"""calibration_data_lib.py -- v2.1.0
 
 Builds static-range (SRQ) calibration samples for
 `export_hf.core.export_lib.quantize_model()`'s `calibration_data` parameter
@@ -114,6 +114,25 @@ cross-check between the Mac fork commit and the Omen hot-patch.
 v1/v2 scope: text-only, matching the phase-7 dispatch ("text-only
 calibration is acceptable for v1 (vision tower is a separate graph)").
 Neither path touches vision-encoder signatures.
+
+v2.1.0 (phase 7e, 2026-07-02): the v2 external-embedder pipeline fixed the
+zero-fill degeneracy above, but the decode gate STILL came back GARBAGE via
+a second, narrower mechanism: golf-only calibration under-covers the
+*logits* tensor's true activation range specifically (golf held-out
+prompt's true top logit sat within one quantization step of the calibrated
+ceiling; a generic prompt's true top logit exceeded that ceiling by 9.75
+units, since no non-golf text was ever in the calibration set). Phase 7e's
+combined fix is two-part: (1) `default_generic_prompts()` below adds 8
+out-of-domain prompts (factual completion / dialogue / list / short
+instruction) rendered through the same chat-template scaffold as the golf
+prompts, so calibration covers a text distribution wider than one domain;
+(2) the logits/LM-head FULLY_CONNECTED op is separately scoped OUT of int8
+activation quantization entirely in the phase 7e recipe (weight-only int8,
+float32 activations -- see `recipes/wa_srq_logits_weightonly.json` and the
+phase 7e dispatch), which structurally removes the saturation failure mode
+for that tensor regardless of calibration coverage. This module only owns
+fix (1); fix (2) lives in the recipe JSON consumed by
+`export_lib.quantize_model()`, not in this file.
 """
 
 import os
@@ -296,6 +315,107 @@ def default_golf_assistant_prompts(tokenizer: Any | None = None) -> list[str]:
       )
       prompts.append(_render_golf_prompt(tokenizer, user_prompt))
   return prompts
+
+
+# -----------------------------------------------------------------------------
+# Generic / out-of-domain prompt curation (phase 7e, added v2.1.0).
+#
+# Deliberately OUTSIDE the golf domain: golf-only calibration left the
+# logits/LM-head tensor's activation range under-covered (see module
+# docstring, "v2.1.0 (phase 7e...)"). These 8 prompts span factual
+# completion, dialogue, list, and short-instruction shapes -- the mix the
+# phase 7e dispatch asked for -- rendered through the same chat-template
+# scaffold as `default_golf_assistant_prompts` so prompt CONTENT is the only
+# varying dimension, not the rendering path.
+# -----------------------------------------------------------------------------
+
+_GENERIC_SYSTEM_PROMPT = (
+    "You are a helpful, knowledgeable assistant. Respond directly and"
+    " concisely."
+)
+
+# 2 prompts x 4 shapes = 8, matching the phase 7e dispatch's "~6-8 prompts,
+# mix: factual completion, dialogue, list, short instruction."
+_GENERIC_USER_PROMPTS = (
+    # factual completion
+    "Complete this fact: The largest planet in our solar system is",
+    "Complete this fact: Water boils at a temperature of",
+    # dialogue
+    (
+        "Continue this dialogue naturally:\n"
+        "User: What time does the store close?\n"
+        "Assistant: The store closes at 9 PM. Anything else I can help"
+        " with?\n"
+        "User: Do you have parking nearby?\n"
+        "Assistant:"
+    ),
+    (
+        "Continue this dialogue naturally:\n"
+        "User: I can't find my keys anywhere.\n"
+        "Assistant: Let's think it through -- where did you last have"
+        " them?\n"
+        "User: I think in my jacket pocket.\n"
+        "Assistant:"
+    ),
+    # list
+    "List three benefits of regular exercise, one per line.",
+    "List the ingredients needed to make a basic omelette, one per line.",
+    # short instruction
+    "Write a one-sentence summary of why recycling matters.",
+    "Translate the phrase 'good morning' into French.",
+)
+
+
+def default_generic_prompts(tokenizer: Any | None = None) -> list[str]:
+  """Returns 8 generic/out-of-domain calibration prompt strings.
+
+  Covers factual completion, dialogue, list, and short-instruction shapes,
+  deliberately outside the golf domain, so SRQ calibration statistics for
+  shared/general-purpose ops (esp. the LM head / logits projection -- see
+  module docstring, "v2.1.0 (phase 7e...)") cover a wider activation range
+  than golf-only text produces. Meant to be combined with
+  `default_golf_assistant_prompts()`'s 16 prompts, not used alone.
+
+  Args:
+    tokenizer: Optional loaded HF tokenizer. Same chat-template-with-fallback
+      rendering as `default_golf_assistant_prompts`.
+  """
+  return [
+      _render_generic_prompt(tokenizer, user_prompt)
+      for user_prompt in _GENERIC_USER_PROMPTS
+  ]
+
+
+def _render_generic_prompt(tokenizer: Any | None, user_prompt: str) -> str:
+  """Renders one generic (system, user) turn pair to a final prompt string.
+
+  Mirrors `_render_golf_prompt`'s chat-template-with-fallback logic (see
+  that function's docstring), using `_GENERIC_SYSTEM_PROMPT` instead of the
+  golf one.
+  """
+  if tokenizer is not None and getattr(tokenizer, "chat_template", None):
+    try:
+      return tokenizer.apply_chat_template(
+          [
+              {"role": "system", "content": _GENERIC_SYSTEM_PROMPT},
+              {"role": "user", "content": user_prompt},
+          ],
+          tokenize=False,
+          add_generation_prompt=True,
+      )
+    except Exception:  # pylint: disable=broad-except
+      try:
+        return tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": _GENERIC_SYSTEM_PROMPT + "\n\n" + user_prompt,
+            }],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+      except Exception:  # pylint: disable=broad-except
+        pass
+  return _GENERIC_SYSTEM_PROMPT + "\n\n" + user_prompt
 
 
 # -----------------------------------------------------------------------------
