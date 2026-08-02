@@ -15,7 +15,9 @@
 """Litert LM builder for packing exported models."""
 
 import dataclasses
+import logging
 import os
+import re
 
 from litert_torch import progress
 from litert_torch.generative.export_hf.core import export_lib
@@ -114,6 +116,40 @@ def parse_chat_template(tokenizer):
   except Exception as e:  # pylint: disable=broad-except
     print(f'Failed to parse chat template: {e}')
     return (None, None), (None, None), (None, None)
+
+
+#: FastVLM's vision tower names its own input resolution, e.g. `mobileclip_l_1024`.
+_FAST_VLM_TOWER_RESOLUTION = re.compile(r'_(\d{3,4})$')
+
+#: The resolution every published FastVLM checkpoint has shipped with so far.
+_FAST_VLM_DEFAULT_RESOLUTION = 1024
+
+
+def _fast_vlm_image_tensor_size(config) -> tuple[int, int]:
+  """Returns the (height, width) the image preprocessor must resize to.
+
+  Read from the checkpoint rather than assumed: the preprocessor resizes every
+  image to this, so a wrong value does not fail loudly -- it feeds the vision
+  tower off-size tensors and quietly degrades every caption the model produces.
+  """
+  for attr in ('image_size', 'vision_tower_input_size'):
+    value = getattr(config, attr, None)
+    if isinstance(value, int) and value > 0:
+      return value, value
+
+  tower = getattr(config, 'mm_vision_tower', None) or ''
+  match = _FAST_VLM_TOWER_RESOLUTION.search(str(tower))
+  if match:
+    size = int(match.group(1))
+    return size, size
+
+  logging.warning(
+      'FastVLM image resolution not declared in config (mm_vision_tower=%r);'
+      ' falling back to %d. Verify against the checkpoint.',
+      tower,
+      _FAST_VLM_DEFAULT_RESOLUTION,
+  )
+  return _FAST_VLM_DEFAULT_RESOLUTION, _FAST_VLM_DEFAULT_RESOLUTION
 
 
 def build_llm_metadata(
@@ -263,6 +299,20 @@ def build_llm_metadata(
   model_type = litert_lm_model_type_override or model.config.model_type
 
   match (model_type):
+    case 'fast_vlm' | 'llava_qwen2':
+      # The runtime selects its data processor from this tag, so a FastVLM
+      # bundle that falls through to generic_model below loads without error
+      # and then never routes an image through the vision path -- a failure
+      # only visible as a model that silently ignores every picture.
+      height, width = _fast_vlm_image_tensor_size(model.config)
+      llm_metadata.llm_model_type.CopyFrom(
+          llm_model_type_pb2.LlmModelType(
+              fast_vlm=llm_model_type_pb2.FastVlm(
+                  image_tensor_height=height,
+                  image_tensor_width=width,
+              )
+          )
+      )
     case 'qwen3':
       llm_metadata.llm_model_type.CopyFrom(
           llm_model_type_pb2.LlmModelType(qwen3=llm_model_type_pb2.Qwen3())
