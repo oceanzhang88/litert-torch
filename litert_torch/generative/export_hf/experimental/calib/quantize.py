@@ -65,6 +65,20 @@ _ALLOW_FLOAT_OPERATIONS = flags.DEFINE_bool(
     'Whether to allow float operations (e.g. RMS Norm, residual ADD) in the'
     ' quantized model.',
 )
+_FLOAT_IO = flags.DEFINE_bool(
+    'float_io',
+    False,
+    'Whether to leave the graph\'s own input and output tensors in float. The'
+    ' main-model recipe quantizes every op via a `.*` / ALL_SUPPORTED rule,'
+    ' which includes the INPUT and OUTPUT pseudo-ops, so the exported graph'
+    ' takes and returns int8. That is right for the LLM, whose caller holds'
+    ' quantized embeddings, and wrong for a vision tower: LiteRT-LM writes the'
+    ' image with `Write<float>` unconditionally'
+    ' (vision_litert_compiled_model_executor.cc) and fails with "TensorBuffer'
+    ' host memory buffer size is smaller than the given data size" when the'
+    ' graph wants int8. Quantization stays internal; only the boundary is'
+    ' float.',
+)
 _SKIP_MLIR_PASSES = flags.DEFINE_bool(
     'skip_mlir_passes',
     False,
@@ -128,6 +142,27 @@ def _scale_calibration_results(
       scaled_qsv['max'] = scaled_max
     scaled_result[tensor_name] = scaled_qsv
   return scaled_result
+
+
+def _maybe_float_io(q: Any) -> Any:
+  """Leaves the graph's own input/output tensors in float, if asked.
+
+  AEQ models the graph boundary as the INPUT and OUTPUT pseudo-ops, so a `.*` /
+  ALL_SUPPORTED rule covers them and the exported graph takes and returns int8.
+  Overriding just those two keeps every internal op quantized while the caller
+  still hands over float.
+  """
+  if not _FLOAT_IO.value:
+    return q
+  print('--- Keeping graph input/output tensors in float.')
+  for op_name in (qtyping.TFLOperationName.INPUT,
+                  qtyping.TFLOperationName.OUTPUT):
+    q.update_quantization_recipe(
+        regex='.*',
+        operation_name=op_name,
+        algorithm_key=quantizer.AlgorithmName.NO_QUANTIZE,
+    )
+  return q
 
 
 def _apply_mlir_passes(quantization_result: Any) -> Any:
@@ -211,6 +246,7 @@ def main(argv: Sequence[str]) -> None:
       allow_float_operations=_ALLOW_FLOAT_OPERATIONS.value,
       a16w8=_A16W8.value,
   )
+  q = _maybe_float_io(q)
 
   print('--- Running main model quantization...')
   quantization_result = q.quantize(calibration_result)

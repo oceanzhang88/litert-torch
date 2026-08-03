@@ -24,10 +24,13 @@ from absl.testing import parameterized
 import flatbuffers
 from litert_torch.generative.export_hf.experimental.litert_lm_npu_compiler import litert_lm_npu_compiler
 
-from ai_edge_litert.aot.core import aot_types
+try:
+  from ai_edge_litert.aot.core import aot_types
+except ImportError:
+  from ai_edge_litert.aot.core import types as aot_types
+from ai_edge_litert import schema_py_generated as schema_fb
 import litert_lm_builder as litertlm_builder
 from litert_lm_builder.runtime.proto import llm_metadata_pb2
-from tensorflow.lite.python import schema_py_generated as schema_fb
 
 
 def build_dummy_tflite_model(signatures_info: list[tuple[str, int]]) -> bytes:
@@ -119,6 +122,131 @@ class LitertLmNpuCompilerTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     self.test_dir = self.create_tempdir()
+    # Production images intentionally select an isolated compiler through ENV.
+    # Unit tests mock ApplyPlugin unless they explicitly exercise that route, so
+    # keep the ambient image configuration from changing their execution path.
+    compiler_env = mock.patch.dict(
+        os.environ,
+        {litert_lm_npu_compiler._AOT_COMPILER_ROOT_ENV: ''},
+        clear=False,
+    )
+    compiler_env.start()
+    self.addCleanup(compiler_env.stop)
+
+  def test_sdk_root_precedes_the_python_sdk_package(self):
+    sdk_root = pathlib.Path(self.test_dir) / 'qairt'
+    sdk_libs = sdk_root / 'lib' / 'x86_64-linux-clang'
+    sdk_libs.mkdir(parents=True)
+
+    with mock.patch.dict(
+        os.environ, {'QNN_SDK_ROOT': str(sdk_root)}, clear=False
+    ), mock.patch.object(
+        litert_lm_npu_compiler.importlib,
+        'import_module',
+        side_effect=AssertionError('Python SDK package must not be consulted'),
+    ):
+      resolved = litert_lm_npu_compiler._resolve_sdk_libs_path('qualcomm')
+
+    self.assertEqual(resolved, str(sdk_libs))
+
+  def test_declared_sdk_root_with_no_host_libs_fails_closed(self):
+    sdk_root = pathlib.Path(self.test_dir) / 'wrong-qairt'
+    sdk_root.mkdir()
+
+    with mock.patch.dict(
+        os.environ, {'QNN_SDK_ROOT': str(sdk_root)}, clear=False
+    ):
+      with self.assertRaisesRegex(
+          FileNotFoundError, 'QNN_SDK_ROOT.*lib/x86_64-linux-clang'
+      ):
+        litert_lm_npu_compiler._resolve_sdk_libs_path('qualcomm')
+
+  @parameterized.named_parameters(
+      ('rc1_runtime_name', 'libLiteRt.so'),
+      ('new_runtime_name', 'libLiteRtRuntimeCApi.so'),
+  )
+  def test_isolated_compiler_root_resolves_its_own_binary_and_plugin(
+      self, runtime_name
+  ):
+    root = pathlib.Path(self.test_dir) / 'litert-rc1' / 'ai_edge_litert'
+    binary = root / 'tools' / 'apply_plugin_main'
+    plugin_dir = root / 'vendors' / 'qualcomm' / 'compiler'
+    runtime = root / runtime_name
+    binary.parent.mkdir(parents=True)
+    plugin_dir.mkdir(parents=True)
+    binary.write_bytes(b'compiler')
+    runtime.write_bytes(b'runtime')
+
+    with mock.patch.dict(
+        os.environ,
+        {litert_lm_npu_compiler._AOT_COMPILER_ROOT_ENV: str(root)},
+        clear=False,
+    ):
+      resolved = litert_lm_npu_compiler._resolve_isolated_compiler_assets(
+          'qualcomm'
+      )
+
+    self.assertEqual(resolved, (root, binary, plugin_dir))
+
+  def test_declared_isolated_compiler_root_fails_closed(self):
+    root = pathlib.Path(self.test_dir) / 'incomplete-litert'
+    root.mkdir()
+
+    with mock.patch.dict(
+        os.environ,
+        {litert_lm_npu_compiler._AOT_COMPILER_ROOT_ENV: str(root)},
+        clear=False,
+    ):
+      with self.assertRaisesRegex(
+          FileNotFoundError, 'LITERT_AOT_COMPILER_ROOT.*compiler assets'
+      ):
+        litert_lm_npu_compiler._resolve_isolated_compiler_assets('qualcomm')
+
+  def test_isolated_apply_uses_versioned_assets_and_qnn_libs(self):
+    root = pathlib.Path(self.test_dir) / 'litert-rc1' / 'ai_edge_litert'
+    binary = root / 'tools' / 'apply_plugin_main'
+    plugin_dir = root / 'vendors' / 'qualcomm' / 'compiler'
+    input_path = pathlib.Path(self.test_dir) / 'input.tflite'
+    output_path = pathlib.Path(self.test_dir) / 'output.tflite'
+    sdk_libs = pathlib.Path(self.test_dir) / 'qairt' / 'lib'
+    input_path.write_bytes(b'\x08\x00\x00\x00TFL3')
+    captured = {}
+
+    def fake_run(args, **kwargs):
+      captured['args'] = args
+      captured['env'] = kwargs['env']
+      output_path.write_bytes(b'\x08\x00\x00\x00TFL3compiled')
+      return litert_lm_npu_compiler.subprocess.CompletedProcess(
+          args, 0, stdout='compiled'
+      )
+
+    with mock.patch.object(
+        litert_lm_npu_compiler.subprocess, 'run', side_effect=fake_run
+    ):
+      litert_lm_npu_compiler._run_isolated_apply_plugin(
+          compiler_assets=(root, binary, plugin_dir),
+          input_path=input_path,
+          output_path=output_path,
+          soc_manufacturer='Qualcomm',
+          soc_model='SM8850',
+          sdk_libs_path=str(sdk_libs),
+          subgraphs_to_compile=[1, 4],
+          flags_dict={
+              'qualcomm_optimization_level': 'O3',
+              'qualcomm_enable_weight_sharing': True,
+          },
+      )
+
+    self.assertIn(f'--libs={plugin_dir}', captured['args'])
+    self.assertIn('--soc_model=SM8850', captured['args'])
+    self.assertIn('--subgraphs=1,4', captured['args'])
+    self.assertIn('--qualcomm_optimization_level=O3', captured['args'])
+    self.assertIn('--qualcomm_enable_weight_sharing=True', captured['args'])
+    self.assertTrue(
+        captured['env']['LD_LIBRARY_PATH'].startswith(
+            f'{root}{os.pathsep}{sdk_libs}'
+        )
+    )
 
   @parameterized.named_parameters(
       ('no_signatures', [], None),

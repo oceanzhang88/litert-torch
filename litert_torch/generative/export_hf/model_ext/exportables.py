@@ -24,6 +24,9 @@ from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_expor
 from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4_unified import vision_exportable as gemma4_unified_vision_exportable
 from litert_torch.generative.export_hf.model_ext.lfm2_vl import vision_exportable as lfm2_vl_vision_exportable
+from litert_torch.generative.export_hf.model_ext.llava_qwen2 import (
+    vision_exportable as fastvlm_vision_exportable,
+)
 from litert_torch.generative.export_hf.model_ext.moonshine import moonshine as moonshine_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as parakeet_ctc_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_tdt as parakeet_tdt_lib
@@ -108,8 +111,21 @@ def get_vision_exportables(
         lfm2_vl_vision_exportable.LiteRTExportableModuleForLFM2VisionAdapter,
         None,
     )
+  elif model_config.model_type == 'llava_qwen2':
+    return (
+        fastvlm_vision_exportable.LiteRTExportableModuleForFastVlmVisionEncoder,
+        fastvlm_vision_exportable.LiteRTExportableModuleForFastVlmVisionAdapter,
+        None,
+    )
   else:
     raise ValueError(f'Unsupported model type: {model_config.model_type}')
+
+
+def get_image_processor(model, model_config, model_path):
+  """Gets the image processor for an image-text model."""
+  if model_config.model_type == 'llava_qwen2':
+    return fastvlm_vision_exportable.get_image_processor(model)
+  return transformers.AutoImageProcessor.from_pretrained(model_path)
 
 
 def get_additional_exportables(

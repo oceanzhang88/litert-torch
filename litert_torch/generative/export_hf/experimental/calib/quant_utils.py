@@ -49,6 +49,7 @@ class gfile:
 # Following BARD250 format.
 PROMPT_TEMPLATE_PREFIX = '<start_of_turn>user\n'
 PROMPT_TEMPLATE_SUFFIX = '<end_of_turn>\n<start_of_turn>model\n'
+_MULTIMODAL_CONTENT_SENTINEL = '__LITERT_MULTIMODAL_REQUEST_CONTENT__'
 
 BASE_SAVE_DIR = ''
 
@@ -101,6 +102,42 @@ def format_prompt(
     return PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
 
 
+def _multimodal_chat_template_boundaries(
+    tokenizer: tokenizer_lib.Tokenizer | None,
+) -> tuple[str, str] | None:
+  """Renders the checkpoint-owned chat wrapper around multimodal content.
+
+  A multimodal request cannot be passed to ``apply_chat_template`` directly:
+  image bytes have to remain separate ``DataItem`` objects so the calibration
+  executor can replace each image with vision embeddings.  Render one unique
+  text sentinel through the checkpoint's template, then split the result into
+  the text before and after the user content.  The real image/text items can be
+  inserted between those boundaries without hard-coding a model family's
+  control tokens.
+
+  Returns ``None`` only when no Transformers chat template is available, which
+  preserves the legacy BARD250 wrapper for SentencePiece-only callers.
+  """
+  if tokenizer is None or tokenizer.tx_tokenizer is None:
+    return None
+  tx_tokenizer = tokenizer.tx_tokenizer
+  if not getattr(tx_tokenizer, 'chat_template', None):
+    return None
+  rendered = tx_tokenizer.apply_chat_template(
+      [{'role': 'user', 'content': _MULTIMODAL_CONTENT_SENTINEL}],
+      tokenize=False,
+      add_generation_prompt=True,
+  )
+  if not isinstance(rendered, str):
+    raise ValueError('chat template did not render a string')
+  if rendered.count(_MULTIMODAL_CONTENT_SENTINEL) != 1:
+    raise ValueError(
+        'chat template must preserve the multimodal content sentinel exactly once'
+    )
+  prefix, suffix = rendered.split(_MULTIMODAL_CONTENT_SENTINEL, maxsplit=1)
+  return prefix, suffix
+
+
 def get_example_prompt(
     example: Any,
     enable_formatting: bool = True,
@@ -135,8 +172,18 @@ def get_example_prompt(
       return prompt
 
     contents = []
+    template_boundaries = (
+        _multimodal_chat_template_boundaries(tokenizer)
+        if enable_formatting
+        else None
+    )
     if enable_formatting:
-      contents.append(tokenizer_lib.DataItem(text=PROMPT_TEMPLATE_PREFIX))
+      prefix = (
+          template_boundaries[0]
+          if template_boundaries is not None
+          else PROMPT_TEMPLATE_PREFIX
+      )
+      contents.append(tokenizer_lib.DataItem(text=prefix))
 
     for data_item in example.get('data_items', []):
       if 'text' in data_item:
@@ -145,9 +192,25 @@ def get_example_prompt(
         contents.append(
             tokenizer_lib.DataItem(image_bytes=data_item['image_bytes'])
         )
+      elif 'image_path' in data_item:
+        # JSON cannot hold raw bytes, so a JSONL corpus has no way to express an
+        # image inline -- which leaves the image branch of this function
+        # unreachable for the one dataset format OSS actually supports, and a
+        # vision-language model calibrated on text alone. Reference the file and
+        # read it here instead; the corpus stays diffable and the media stays
+        # out of it.
+        with gfile.Open(data_item['image_path'], 'rb') as image_file:
+          contents.append(
+              tokenizer_lib.DataItem(image_bytes=image_file.read())
+          )
 
     if enable_formatting:
-      contents.append(tokenizer_lib.DataItem(text=PROMPT_TEMPLATE_SUFFIX))
+      suffix = (
+          template_boundaries[1]
+          if template_boundaries is not None
+          else PROMPT_TEMPLATE_SUFFIX
+      )
+      contents.append(tokenizer_lib.DataItem(text=suffix))
 
     return tokenizer_lib.Request(contents=contents)
 

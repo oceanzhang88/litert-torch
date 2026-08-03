@@ -18,11 +18,17 @@ import json
 import os
 import shutil
 import tempfile
+from types import SimpleNamespace
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
 
 from litert_torch.generative.export_hf.core import export_lib
+from litert_torch.generative.export_hf.core import exportable_module_config
+from litert_torch.generative.export_hf.core.split_cache import (
+    exportable_module as split_cache_module,
+)
 
 
 class ExportLibTest(parameterized.TestCase):
@@ -190,6 +196,129 @@ class ExportLibTest(parameterized.TestCase):
           model="dummy_model",
           enable_dynamic_shape=True,
           enable_gpu_dynamic_cache=True,
+      )
+
+  def test_sentencepiece_format_converts_directly(self):
+    class Tokenizer:
+
+      def save_pretrained(self, *args, **kwargs):
+        raise AssertionError("JSON export must not run in SentencePiece mode")
+
+    config = exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        work_dir=self.test_dir,
+        tokenizer_format="sentencepiece",
+    )
+    source_artifacts = SimpleNamespace(tokenizer=Tokenizer())
+    with mock.patch.object(
+        export_lib.tokenizer_lib, "convert", return_value=b"sentencepiece"
+    ) as convert:
+      artifacts = export_lib.export_tokenizer(
+          source_artifacts, config, export_lib.ExportedModelArtifacts()
+      )
+
+    convert.assert_called_once_with(source_artifacts.tokenizer)
+    self.assertEqual(
+        artifacts.tokenizer_model_path,
+        os.path.join(self.test_dir, "tokenizer.spiece"),
+    )
+    with open(artifacts.tokenizer_model_path, "rb") as tokenizer_file:
+      self.assertEqual(tokenizer_file.read(), b"sentencepiece")
+
+  def test_block_embedder_recipe_preserves_float_calibration_path(self):
+    float_path = os.path.join(self.test_dir, "embedder_calibration.tflite")
+    quantized_path = os.path.join(
+        self.test_dir, "embedder_calibration_quantized.tflite"
+    )
+    config = exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        split_cache=True,
+        block_embedder_quantization_recipe="dynamic_wi8_afp32",
+    )
+    source = export_lib.ExportedModelArtifacts(
+        calibration_embedder_model_path=float_path
+    )
+    with mock.patch.object(
+        export_lib, "quantize_model", return_value=quantized_path
+    ) as quantize:
+      result = export_lib.prepare_shipped_block_embedder_model(
+          None, config, source
+      )
+
+    quantize.assert_called_once_with(float_path, "dynamic_wi8_afp32")
+    self.assertEqual(result.calibration_embedder_model_path, float_path)
+    self.assertEqual(result.embedder_model_path, quantized_path)
+    self.assertTrue(config.export_calibration_embedder)
+
+  def test_calibration_embedder_export_disables_quantization(self):
+    config = exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        task=exportable_module_config.ExportTask.IMAGE_TEXT_TO_TEXT,
+        quantization_recipe="static_wi8_ai16",
+        export_calibration_embedder=True,
+    )
+    with mock.patch.object(
+        export_lib, "_export_embedder_impl", return_value="artifacts"
+    ) as export_impl:
+      result = export_lib.export_calibration_embedder_model(
+          None, config, export_lib.ExportedModelArtifacts()
+      )
+
+    self.assertEqual(result, "artifacts")
+    self.assertIsNone(export_impl.call_args.kwargs["quantization_recipe"])
+    self.assertFalse(
+        export_impl.call_args.args[1].single_token_embedder
+    )
+
+  def test_split_cache_mask_fill_is_checkpoint_owned(self):
+    small = split_cache_module.SplitAttentionMaskBuilder(
+        context_size=1280, mask_fill=-100.0
+    )
+    large = split_cache_module.SplitAttentionMaskBuilder(
+        context_size=1280, mask_fill=-1e4
+    )
+
+    self.assertEqual(small.global_mask.mask_fill, -100.0)
+    self.assertEqual(large.global_mask.mask_fill, -1e4)
+
+  def test_split_cache_mask_sample_inputs_preserve_production_abi(self):
+    config = exportable_module_config.ExportableModuleConfig(
+        model="dummy_model",
+        split_cache=True,
+        prefill_lengths=[128],
+    )
+    production_builder = split_cache_module.SplitAttentionMaskBuilder(
+        context_size=1280
+    )
+    current_runtime_builder = split_cache_module.SplitAttentionMaskBuilder(
+        context_size=1280, pad_token=None
+    )
+
+    production_inputs = production_builder.get_sample_inputs(None, config)
+    current_runtime_inputs = current_runtime_builder.get_sample_inputs(
+        None, config
+    )
+    for signature_inputs, _ in production_inputs.values():
+      self.assertEqual(
+          set(signature_inputs), {"input_tokens", "time_step"}
+      )
+    for signature_inputs, _ in current_runtime_inputs.values():
+      self.assertEqual(
+          set(signature_inputs), {"input_tokens", "time_step", "valid_mask"}
+      )
+
+  def test_block_embedder_recipe_rejects_portable_executor(self):
+    with self.assertRaisesRegex(ValueError, "requires split_cache=True"):
+      exportable_module_config.ExportableModuleConfig(
+          model="dummy_model",
+          split_cache=False,
+          block_embedder_quantization_recipe="dynamic_wi8_afp32",
+      )
+
+  def test_tokenizer_format_rejects_unknown_value(self):
+    with self.assertRaisesRegex(ValueError, "Unsupported tokenizer_format"):
+      exportable_module_config.ExportableModuleConfig(
+          model="dummy_model", tokenizer_format="tokenizer-of-the-day"
       )
 
 

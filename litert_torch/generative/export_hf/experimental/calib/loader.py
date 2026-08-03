@@ -58,6 +58,7 @@ def load_models(
     enable_min_max_calibration_update: bool = True,
     ema_smoothing_factor: float = 0.95,
     use_profiler_based_calibration: bool = False,
+    trust_remote_code: bool = False,
 ) -> tfl_sampling_executor.TflSamplingExecutorConfig:
   """Loads the models."""
   if isinstance(model_path, tuple):
@@ -158,7 +159,8 @@ def load_models(
   )
   tokenizer_config = tokenizer_lib.TokenizerConfig(
       vocab_path=spm_path,
-      transformers_model_path=transformers_model_path
+      transformers_model_path=transformers_model_path,
+      trust_remote_code=trust_remote_code,
   )
   return tfl_sampling_executor.TflSamplingExecutorConfig(
       prefill_model_entries=prefill_model_entries,

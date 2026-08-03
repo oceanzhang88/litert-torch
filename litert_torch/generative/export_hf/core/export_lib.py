@@ -15,6 +15,7 @@
 """Export library for HF integration."""
 
 import contextlib
+import copy
 import dataclasses
 import gc
 import json
@@ -72,6 +73,9 @@ class ExportedModelArtifacts:
 
   prefill_decode_model_path: str | None = None
   embedder_model_path: str | None = None
+  # Float block-signature embedder retained for calibration. A separately
+  # quantized copy may be promoted into `embedder_model_path` for packaging.
+  calibration_embedder_model_path: str | None = None
   vision_encoder_model_path: str | None = None
   vision_adapter_model_path: str | None = None
   eoi_model_path: str | None = None
@@ -80,6 +84,9 @@ class ExportedModelArtifacts:
   additional_model_paths: dict[str, str] | None = None
 
   litert_lm_model_path: str | None = None
+  # Per-backend partition stats from AOT compilation: the only evidence that
+  # separates "compiled" from "actually offloaded to the NPU".
+  aot_compilation_report: str | None = None
 
 
 def verify_model_compatibility(model, model_config, text_model_config):
@@ -264,8 +271,8 @@ def load_model(
     pass
 
   if task == ExportTask.IMAGE_TEXT_TO_TEXT:
-    image_processor = transformers.AutoImageProcessor.from_pretrained(
-        model_path
+    image_processor = model_ext_exportables.get_image_processor(
+        model, config, model_path
     )
   else:
     image_processor = None
@@ -530,16 +537,18 @@ def quantize_model(
   return quantized_model_path
 
 
-@progress.task('Export embedder model')
-def export_embedder_model(
+def _export_embedder_impl(
     source_model_artifacts: SourceModelArtifacts,
     export_config: exportable_module.ExportableModuleConfig,
     exported_model_artifacts: ExportedModelArtifacts,
+    *,
+    filename: str,
+    artifact_field: str,
+    quantization_recipe: str | None,
 ):
-  """Exports embedder."""
+  """Exports the embedder under `filename`, recording it in `artifact_field`."""
   model = source_model_artifacts.model
   text_model_config = source_model_artifacts.text_model_config
-  quantization_recipe = export_config.quantization_recipe
   work_dir = export_config.work_dir
 
   # Patch model instance for export.
@@ -563,7 +572,9 @@ def export_embedder_model(
         lightweight_conversion=export_config.experimental_lightweight_conversion,
         strict_export=False,
     )
-  model_path = os.path.join(work_dir, 'embedder.tflite')  # pyrefly: ignore[no-matching-overload]
+  model_path = os.path.join(
+      work_dir, filename
+  )  # pyrefly: ignore[no-matching-overload]
   lrt_model.export(model_path)
   quantization_recipe_list = (
       quantization_recipe.split(',') if quantization_recipe else [None]
@@ -573,7 +584,110 @@ def export_embedder_model(
     gc.collect()
   return dataclasses.replace(
       exported_model_artifacts,
-      embedder_model_path=model_path,
+      **{artifact_field: model_path},
+  )
+
+
+@progress.task('Export embedder model')
+def export_embedder_model(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+):
+  """Exports the embedder that ships inside the bundle."""
+  return _export_embedder_impl(
+      source_model_artifacts,
+      export_config,
+      exported_model_artifacts,
+      filename='embedder.tflite',
+      artifact_field='embedder_model_path',
+      quantization_recipe=export_config.quantization_recipe,
+  )
+
+
+def calibration_embedder_config(
+    export_config: exportable_module.ExportableModuleConfig,
+) -> exportable_module.ExportableModuleConfig:
+  """Returns `export_config` with the single-token embedder shape turned off.
+
+  Deliberately `copy.copy` and not `dataclasses.replace`: replace() re-runs
+  `__post_init__`, whose image-text-to-text branch sets
+  `single_token_embedder = True` unconditionally. It would therefore hand back a
+  config with this very override already undone, and the export would write a
+  second, byte-identical copy of the single-token graph -- failing three stages
+  later with a signature-key error that points nowhere near here.
+  """
+  calibration_config = copy.copy(export_config)
+  calibration_config.single_token_embedder = False
+  return calibration_config
+
+
+@progress.task('Export calibration embedder model')
+def export_calibration_embedder_model(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+):
+  """Exports a block-signature embedder used only to drive calibration.
+
+  Vision-language export forces `single_token_embedder`, because the runtime
+  interleaves image features between individual text embeddings and therefore
+  wants a one-token-at-a-time graph. The calibration executor is built for the
+  text-LLM layout instead: it infers prefill buckets from the text model and
+  asks the embedder for `prefill_embedder_{length}`, feeding it a whole chunk.
+  Those two contracts cannot be met by one graph.
+
+  Rather than reshape the shipped embedder to suit calibration -- which would
+  hand the device a graph its runtime cannot drive -- this exports a second one
+  carrying both signatures, `decode_embedder` and `prefill_embedder_{length}`.
+
+  It is never quantized: calibration wants activation ranges from the original
+  float graph. If the block topology also needs to ship, a later task quantizes
+  this file into a separate output and promotes only that copy into the bundle.
+  """
+  return _export_embedder_impl(
+      source_model_artifacts,
+      calibration_embedder_config(export_config),
+      exported_model_artifacts,
+      filename='embedder_calibration.tflite',
+      artifact_field='calibration_embedder_model_path',
+      quantization_recipe=None,
+  )
+
+
+@progress.task('Prepare shipped block embedder model')
+def prepare_shipped_block_embedder_model(
+    source_model_artifacts: SourceModelArtifacts,
+    export_config: exportable_module.ExportableModuleConfig,
+    exported_model_artifacts: ExportedModelArtifacts,
+):
+  """Quantizes a copy of the float block embedder for bundle packaging.
+
+  The source path remains recorded as `calibration_embedder_model_path`; the
+  newly quantized path becomes `embedder_model_path`. Keeping the two artifact
+  identities distinct prevents calibration from silently running through an
+  already-quantized table while still giving the NPU executor its required
+  `decode_embedder` and `prefill_embedder_*` signatures.
+  """
+  del source_model_artifacts  # Unused.
+  model_path = exported_model_artifacts.calibration_embedder_model_path
+  if model_path is None:
+    raise ValueError(
+        'A float calibration embedder must be exported before preparing the'
+        ' shipped block embedder.'
+    )
+  recipe = export_config.block_embedder_quantization_recipe
+  if not recipe:
+    raise ValueError(
+        'block_embedder_quantization_recipe is required when preparing the'
+        ' shipped block embedder.'
+    )
+  shipped_model_path = quantize_model(model_path, recipe)
+  if shipped_model_path == model_path:
+    raise ValueError('Shipped block embedder quantization must create a copy.')
+  return dataclasses.replace(
+      exported_model_artifacts,
+      embedder_model_path=shipped_model_path,
   )
 
 
@@ -779,10 +893,17 @@ def export_auxiliary_model(
         sample_kwargs=sample_input,
     )
   # Attention Mask
+  #
+  # `pad_token` is left at 0 rather than taken from the tokenizer on purpose:
+  # Google's official FastVLM-0.5B NPU graph and production Golf e471 use the
+  # older two-input mask ABI and leave zero in unused token slots. Current
+  # LiteRT-LM can additionally write an optional `valid_mask`; callers targeting
+  # only that runtime can opt into the three-input ABI with `pad_token=None`.
   sliding_window_sizes = [getattr(text_model_config, 'sliding_window', None)]
   attention_mask_module = split_cache_module.SplitAttentionMaskBuilder(
       export_config.cache_length,
       sliding_window_sizes=sliding_window_sizes,
+      mask_fill=export_config.split_cache_mask_fill,
   )
   sample_inputs = attention_mask_module.get_sample_inputs(
       text_model_config, export_config
@@ -920,7 +1041,27 @@ def export_tokenizer(
   """Exports tokenizer."""
   tokenizer = source_model_artifacts.tokenizer
   work_dir = export_config.work_dir
-  if hasattr(tokenizer, 'vocab_file') and tokenizer.vocab_file:
+  if (
+      export_config.tokenizer_format
+      == exportable_module_config.TokenizerFormat.SENTENCEPIECE
+  ):
+    spm_serialized = tokenizer_lib.convert(tokenizer)
+    tokenizer_path = os.path.join(
+        work_dir, 'tokenizer.spiece'
+    )  # pyrefly: ignore[no-matching-overload]
+    with open(tokenizer_path, 'wb') as f:
+      f.write(spm_serialized)
+    return dataclasses.replace(
+        exported_model_artifacts,
+        tokenizer_model_path=tokenizer_path,
+    )
+
+  if (
+      export_config.tokenizer_format
+      != exportable_module_config.TokenizerFormat.HUGGING_FACE
+      and hasattr(tokenizer, 'vocab_file')
+      and tokenizer.vocab_file
+  ):
     tokenizer_path = tokenizer.vocab_file
     if tokenizer_path.endswith('tokenizer.model'):
       with open(tokenizer_path, 'rb') as f:
@@ -946,6 +1087,11 @@ def export_tokenizer(
         tokenizer_model_path=tokenizer_path,
     )
   except Exception:  # pylint: disable=broad-exception-caught
+    if (
+        export_config.tokenizer_format
+        == exportable_module_config.TokenizerFormat.HUGGING_FACE
+    ):
+      raise
     # Fallback to convert tokenizer to sentencepiece.
     print('Failed to export tokenizer. Converting to sentencepiece.')
     spm_serialized = tokenizer_lib.convert(tokenizer)
@@ -992,11 +1138,29 @@ def aot_compile_model(
       source_model,
       output_dir=output_dir,
       config=aot_config,
+      # One named SoC is the whole point of this task, so a backend failure is
+      # the answer, not a thing to collect and continue past. The default True
+      # gathers failures into `failed_backends` and returns; with a single
+      # target that leaves an empty `models` and an assertion that names
+      # nothing. False raises the compiler's own error instead.
+      keep_going=False,
   )
   assert aot_results.models, 'AOT compilation failed.'
   assert len(aot_results.models) == 1, 'Currently only support one target.'
+
+  # Compilation succeeding is not the same as the graph running on the NPU.
+  # The compiler partitions: what it cannot legalize stays on CPU, and the
+  # result is still a valid, exportable model. `partition_stats` is the only
+  # place that distinction is visible, so surface it rather than discarding it
+  # and calling a mostly-CPU bundle an NPU build.
+  report = aot_results.compilation_report()
+  print(report)
+  if aot_results.failed_backends:
+    raise RuntimeError(f'AOT compilation reported failures:\n{report}')
+
   aot_results.models[0].save(output_path, export_only=True)
   return dataclasses.replace(
       exported_model_artifacts,
       prefill_decode_model_path=output_path,
+      aot_compilation_report=report,
   )

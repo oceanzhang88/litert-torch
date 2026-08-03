@@ -263,33 +263,79 @@ class LiteRTSplitCacheExportableModuleForDecoderOnlyLMGenerate(
 
 
 class SplitAttentionMaskBuilder(nn.Module):
-  """Split attention mask builder."""
+  """Split attention mask builder.
+
+  The signatures this exports are a contract with whatever runtime consumes
+  them, and the input set is the contract's most brittle half: an input the
+  runtime does not know to write is not a missing feature at runtime, it is a
+  tensor of zeros. For a *bool validity* mask that reads as "no token in this
+  chunk is valid", which erases the entire prefill mask -- every position
+  masked, so the additive fill is constant across each row, cancels in the
+  softmax, and leaves attention both non-causal and free to read the empty
+  cache. Prefill then writes a KV cache that has nothing to do with the prompt
+  while decode, whose mask never depends on validity, keeps running normally.
+  The model stays fluent and stops answering the question.
+
+  Google's official FastVLM-0.5B NPU auxiliary graph and the deployed Golf e471
+  runtime use the older two-input mask ABI: `input_tokens` and `time_step`.
+  Current LiteRT-LM also supports an optional `valid_mask`, but adding it to the
+  exported signature makes that graph incompatible with those production
+  consumers. Therefore `pad_token` -- deriving validity inside the graph -- is
+  the compatibility default, while `pad_token=None` explicitly opts into the
+  current three-input runtime ABI.
+
+  Passing the token id the older caller pads with matters: it `memset`s the
+  token buffer and fills only the real ids, so its padding value is literally
+  0, whatever the tokenizer's own pad id happens to be.
+  """
 
   def __init__(
       self,
       context_size: int,
       sliding_window_sizes: list[int | None] | None = None,
+      pad_token: int | None = 0,
+      mask_fill: float | None = None,
   ):
     super().__init__()
     if sliding_window_sizes is None:
       sliding_window_sizes = [None]
     local_masks = {}
-    self.global_mask = attention_mask.SplitAttentionMask(context_size, None)
+    if mask_fill is None:
+      mask_fill = attention_mask.DEFAULT_MASK_FILL
+    self.global_mask = attention_mask.SplitAttentionMask(
+        context_size, None, mask_fill
+    )
     for sliding_window_size in sliding_window_sizes:
       if sliding_window_size is not None:
         local_masks[sliding_window_size] = attention_mask.SplitAttentionMask(
-            context_size, sliding_window_size
+            context_size, sliding_window_size, mask_fill
         )
       else:
-        self.global_mask = attention_mask.SplitAttentionMask(context_size, None)
+        self.global_mask = attention_mask.SplitAttentionMask(
+            context_size, None, mask_fill
+        )
     self.local_masks = local_masks
+    self.pad_token = pad_token
 
   def forward(
       self,
       input_tokens: torch.Tensor,
       time_step: torch.Tensor,
-      valid_mask: torch.Tensor,
+      valid_mask: torch.Tensor | None = None,
   ) -> dict[str, attention_mask.SplitMask]:
+    if valid_mask is None:
+      if self.pad_token is None:
+        raise ValueError(
+            'valid_mask is required when the builder was configured to take '
+            'it as an input (pad_token=None).'
+        )
+      if input_tokens.shape[1] == 1:
+        # A single-token chunk is the token being decoded; there is no padding
+        # to detect, and comparing against the pad id here would only make a
+        # token that happens to *be* that id unable to attend to itself.
+        valid_mask = torch.ones_like(input_tokens, dtype=torch.bool)
+      else:
+        valid_mask = input_tokens != self.pad_token
     if self.global_mask is None:
       global_mask = None
     else:
@@ -309,28 +355,37 @@ class SplitAttentionMaskBuilder(nn.Module):
         )
     }
 
-  @classmethod
   def get_sample_inputs(
-      cls,
+      self,
       model_config,
       export_config: base_exportable_module.ExportableModuleConfig,
   ):
-    """Gets sample inputs."""
+    """Gets sample inputs.
+
+    An instance method rather than a classmethod because the sample inputs are
+    what fix the exported signature's input set, and that set depends on how
+    this instance was configured. Deriving them from anything other than the
+    live `forward` is how a signature drifts from the graph it names.
+    """
     del model_config
+    takes_valid_mask = self.pad_token is None
+
+    def _inputs(length: int):
+      inputs = {
+          'input_tokens': torch.full((1, length), 0, dtype=torch.int32),
+          'time_step': torch.tensor(1, dtype=torch.int32),
+      }
+      if takes_valid_mask:
+        inputs['valid_mask'] = torch.ones((1, length), dtype=torch.bool)
+      return inputs
+
     sample_inputs = {}
     for prefill_length in export_config.prefill_lengths:
-      inputs = {
-          'input_tokens': torch.full((1, prefill_length), 0, dtype=torch.int32),
-          'time_step': torch.tensor(1, dtype=torch.int32),
-          'valid_mask': torch.ones((1, prefill_length), dtype=torch.bool),
-      }
-      sample_inputs[f'prefill_mask_{prefill_length}'] = (inputs, {})
-    decode_inputs = {
-        'input_tokens': torch.full((1, 1), 0, dtype=torch.int32),
-        'time_step': torch.tensor(1, dtype=torch.int32),
-        'valid_mask': torch.ones((1, 1), dtype=torch.bool),
-    }
-    sample_inputs['decode_mask'] = (decode_inputs, {})
+      sample_inputs[f'prefill_mask_{prefill_length}'] = (
+          _inputs(prefill_length),
+          {},
+      )
+    sample_inputs['decode_mask'] = (_inputs(1), {})
     return sample_inputs
 
 

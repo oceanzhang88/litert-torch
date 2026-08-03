@@ -16,11 +16,10 @@
 
 import math
 from typing import Optional
-from litert_torch.backend import composite
 from litert_torch.generative.custom_ops import bmm_4d as bmm_lib
+from litert_torch.generative.export_hf.core import softmax as softmax_lib
 from litert_torch.generative.export_hf.experimental.composites import runtime_batched_matmul
 import torch
-import torch.nn.functional as F
 
 runtime_bmm = runtime_batched_matmul.runtime_bmm
 
@@ -41,6 +40,7 @@ def scaled_dot_product_attention_transposed(
     alibi_bias: Optional[torch.Tensor] = None,
     param_tensor: Optional[torch.Tensor] = None,
     is_global: bool = False,
+    use_softmax_composite: bool = True,
 ):
   """Scaled dot product attention with transposed key and value.
 
@@ -57,6 +57,8 @@ def scaled_dot_product_attention_transposed(
     alibi_bias (torch.Tensor): optional alibi bias tensor.
     param_tensor (torch.Tensor): optional param tensor for runtime bmm.
     is_global (bool): whether the attention is global.
+    use_softmax_composite (bool): whether to outline softmax as an ODML
+      StableHLO composite instead of keeping the builtin TFLite operator form.
 
   Returns:
     The output tensor of scaled_dot_product_attention_transposed.
@@ -118,11 +120,11 @@ def scaled_dot_product_attention_transposed(
     else:
       padded_logits = logits + mask
 
-  attrs = {"axis": -1}
-  builder = composite.StableHLOCompositeBuilder(name="odml.softmax", attr=attrs)
-  padded_logits = builder.mark_inputs(padded_logits)
-  probs = F.softmax(padded_logits, dim=-1)
-  probs = builder.mark_outputs(probs)
+  probs = softmax_lib.apply_softmax(
+      padded_logits,
+      dim=-1,
+      use_composite=use_softmax_composite,
+  )
   probs = probs.type_as(key)
   if param_tensor is not None:
     bmm_fn = lambda x, y: runtime_batched_matmul.runtime_bmm(

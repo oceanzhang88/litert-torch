@@ -29,6 +29,14 @@ class ExportTask(str, enum.Enum):
   AUTOMATIC_SPEECH_RECOGNITION = "automatic_speech_recognition"
 
 
+class TokenizerFormat(str, enum.Enum):
+  """Tokenizer representation written into a LiteRT-LM bundle."""
+
+  AUTO = "auto"
+  HUGGING_FACE = "hugging_face"
+  SENTENCEPIECE = "sentencepiece"
+
+
 @dataclasses.dataclass
 class ExportableModuleConfig:
   """Config for exportable modules."""
@@ -54,6 +62,11 @@ class ExportableModuleConfig:
   k_ts_idx: int = 2
   v_ts_idx: int = 3
   split_cache: bool = False
+  # Additive value used for masked positions in the split-cache auxiliary
+  # graph. This is checkpoint-owned: a value deep enough for one checkpoint can
+  # unnecessarily coarsen the int16 mask scale of another. None preserves the
+  # attention module's compatibility default; production recipes should set it.
+  split_cache_mask_fill: float | None = None
   cache_implementation: str | None = None
   auto_model_override: str | None = None
   use_jinja_template: bool = True
@@ -66,6 +79,12 @@ class ExportableModuleConfig:
   fuse_gate_up: bool = False
   fuse_qkv: bool = False
   use_rope_composite: bool = False
+  # Whether attention softmax is outlined as an odml.softmax StableHLO
+  # composite. None preserves each attention implementation's existing default:
+  # post-dcbe166 non-split attention outlines it, while split-cache attention
+  # retains a builtin TFLite SOFTMAX. Compatibility recipes can set False
+  # explicitly to require the builtin form across both paths.
+  use_softmax_composite: bool | None = None
   input_sec: float = 1.0
   # If >= 0, the model runs in stateful mode after this many tokens.
   stateful_after: int = -1
@@ -74,9 +93,18 @@ class ExportableModuleConfig:
   # if you intend to run on CPU, and set dynamic_wi8_afp32 if you intend to run
   # on GPU.
   vision_encoder_quantization_recipe: str | None = "dynamic_wi8_afp32"
+  # Also export a block-signature embedder for the calibration executor. Only
+  # meaningful when `single_token_embedder` is on (the vision-language shape),
+  # where the shipped embedder cannot serve `prefill_embedder_{length}`.
+  export_calibration_embedder: bool = False
+  # When set, the block-signature calibration embedder is quantized into a
+  # separate file with this recipe and becomes the embedder shipped in the
+  # bundle. The original float graph remains available for calibration.
+  block_embedder_quantization_recipe: str | None = None
   litert_lm_model_type_override: str | None = None
   litert_lm_llm_metadata_override: str | None = None
   tokenizer_path_override: str | None = None
+  tokenizer_format: TokenizerFormat | str = TokenizerFormat.AUTO
   llm_metadata_max_num_tokens_override: int | None = None
   sampler_top_p: float | None = None
   sampler_temperature: float | None = None
@@ -108,6 +136,15 @@ class ExportableModuleConfig:
 
   def __post_init__(self):
     """Refines configuration based on task-specific rules."""
+    try:
+      self.tokenizer_format = TokenizerFormat(self.tokenizer_format)
+    except ValueError as e:
+      supported = ", ".join(x.value for x in TokenizerFormat)
+      raise ValueError(
+          f"Unsupported tokenizer_format {self.tokenizer_format!r}; expected"
+          f" one of: {supported}."
+      ) from e
+
     if isinstance(self.prefill_lengths, int):
       self.prefill_lengths = [self.prefill_lengths]
     elif isinstance(self.prefill_lengths, str):
@@ -138,6 +175,16 @@ class ExportableModuleConfig:
       if self.cache_implementation is None:
         self.cache_implementation = "LiteRTLMSplitCache"
       self.moe_exports_implementation = "litert_moe_sequential"
+
+    if self.block_embedder_quantization_recipe:
+      if not self.split_cache:
+        raise ValueError(
+            "block_embedder_quantization_recipe requires split_cache=True; the"
+            " portable executor consumes the single-signature embedder."
+        )
+      # The block graph is exported once in float for calibration, then copied
+      # through the requested dynamic weight quantizer for packaging.
+      self.export_calibration_embedder = True
 
     if self.enable_gpu_dynamic_prefill or self.enable_gpu_dynamic_cache:
       if self.enable_dynamic_shape:

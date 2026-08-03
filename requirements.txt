@@ -5,7 +5,7 @@ torchaudio==2.11.0
 torchao>=0.17.0
 --pre
 ai-edge-litert-nightly[model-utils]
-ai-edge-quantizer-nightly
+ai-edge-quantizer
 litert-converter>=0.0.0.dev0
 jax[cpu]
 scipy

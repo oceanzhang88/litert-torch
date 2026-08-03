@@ -22,6 +22,7 @@ import re
 from litert_torch import progress
 from litert_torch.generative.export_hf.core import export_lib
 from litert_torch.generative.export_hf.core import exportable_module
+from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.experimental.minijinja_transpile import transpile as transpile_lib
 from litert_torch.generative.export_hf.model_ext import metadata_builder as metadata_builder_lib
 
@@ -176,15 +177,24 @@ def build_llm_metadata(
 
   stop_tokens = set()
   gen_config = getattr(model, 'generation_config', None)
+  # Tracks whether a usable id was actually taken from the generation config,
+  # not merely whether the attribute exists. `GenerationConfig` always defines
+  # `eos_token_id`, so testing with `hasattr` reports success even when the
+  # value is None -- which is what FastVLM's generation_config.json leaves it
+  # as. That suppressed the tokenizer fallback below and shipped a bundle whose
+  # only stop token was the chat template's "<|im_end|>\n" suffix and its
+  # punctuation-prefixed variants, with no bare "<|im_end|>" among them, so
+  # generation ran to the token limit on every turn.
   has_eos_token_id = False
   if gen_config:
-    if hasattr(gen_config, 'eos_token_id'):
+    eos_token_id = getattr(gen_config, 'eos_token_id', None)
+    if isinstance(eos_token_id, int):
+      stop_tokens.add(eos_token_id)
       has_eos_token_id = True
-      if isinstance(gen_config.eos_token_id, int):
-        stop_tokens.add(gen_config.eos_token_id)
-      elif isinstance(gen_config.eos_token_id, list):
-        for token_id in gen_config.eos_token_id:
-          stop_tokens.add(token_id)
+    elif isinstance(eos_token_id, list):
+      for token_id in eos_token_id:
+        stop_tokens.add(token_id)
+      has_eos_token_id = bool(eos_token_id)
   if (
       not has_eos_token_id
       and hasattr(tokenizer, 'eos_token')
@@ -222,50 +232,55 @@ def build_llm_metadata(
       tu = llm_metadata.stop_tokens.add()
       tu.token_str = stop_token
 
-    sampler_top_k = export_config.sampler_top_k
-    sampler_top_p = export_config.sampler_top_p
-    sampler_temperature = export_config.sampler_temperature
+  sampler_top_k = export_config.sampler_top_k
+  sampler_top_p = export_config.sampler_top_p
+  sampler_temperature = export_config.sampler_temperature
 
-    has_custom_sampler = (
-        sampler_top_k is not None
-        or sampler_top_p is not None
-        or sampler_temperature is not None
-    )
+  final_top_k = (
+      sampler_top_k
+      if sampler_top_k is not None
+      else (getattr(gen_config, 'top_k', None) if gen_config else None)
+  )
+  final_top_p = (
+      sampler_top_p
+      if sampler_top_p is not None
+      else (getattr(gen_config, 'top_p', None) if gen_config else None)
+  )
+  final_temperature = (
+      sampler_temperature
+      if sampler_temperature is not None
+      else (getattr(gen_config, 'temperature', None) if gen_config else None)
+  )
 
-    if has_custom_sampler or (gen_config and getattr(gen_config, 'do_sample', False)):
-      sampler_params = llm_metadata.sampler_params
+  # Only describe a sampler when there is something to describe. `do_sample`
+  # alone is not enough: a config can set it while leaving top_k, top_p and
+  # temperature at None, and writing `sampler_params` from that produces a
+  # message whose type is TOP_P and whose k, p and temperature are proto3
+  # defaults -- k=0, p=0.0, temperature=0.0. That is worse than writing nothing,
+  # because `engine_settings.cc` only fills in defaults when the field is
+  # *absent*; present-but-empty is taken at face value, and TopPSampler::Create
+  # rejects k=0 outright. Leaving it unset lets the runtime choose per backend:
+  # k=1/p=0.95/temperature=1.0 on CPU and GPU, and TYPE_UNSPECIFIED on NPU,
+  # where the compiled decode graph does its own greedy sampling.
+  if (
+      final_top_k is not None
+      or final_top_p is not None
+      or final_temperature is not None
+  ):
+    sampler_params = llm_metadata.sampler_params
+    if final_top_k is not None:
+      sampler_params.k = final_top_k
+    if final_top_p is not None:
+      sampler_params.p = final_top_p
+    if final_temperature is not None:
+      sampler_params.temperature = final_temperature
 
-      final_top_k = (
-          sampler_top_k
-          if sampler_top_k is not None
-          else (getattr(gen_config, 'top_k', None) if gen_config else None)
-      )
-      final_top_p = (
-          sampler_top_p
-          if sampler_top_p is not None
-          else (getattr(gen_config, 'top_p', None) if gen_config else None)
-      )
-      final_temperature = (
-          sampler_temperature
-          if sampler_temperature is not None
-          else (getattr(gen_config, 'temperature', None) if gen_config else None)
-      )
-
-      if final_top_k is not None:
-        sampler_params.k = final_top_k
-      if final_top_p is not None:
-        sampler_params.p = final_top_p
-      if final_temperature is not None:
-        sampler_params.temperature = final_temperature
-
-      if final_top_k == 1:
-        sampler_params.type = sampler_params_pb2.SamplerParameters.GREEDY
-      elif final_top_p is not None:
-        sampler_params.type = sampler_params_pb2.SamplerParameters.TOP_P
-      elif final_top_k is not None:
-        sampler_params.type = sampler_params_pb2.SamplerParameters.TOP_K
-      else:
-        sampler_params.type = sampler_params_pb2.SamplerParameters.TOP_P
+    if final_top_k == 1:
+      sampler_params.type = sampler_params_pb2.SamplerParameters.GREEDY
+    elif final_top_p is not None:
+      sampler_params.type = sampler_params_pb2.SamplerParameters.TOP_P
+    else:
+      sampler_params.type = sampler_params_pb2.SamplerParameters.TOP_K
 
   if gen_config and getattr(gen_config, 'suppress_tokens', None):
     suppress_tokens = gen_config.suppress_tokens
@@ -451,7 +466,17 @@ def package_model(
   assert (
       tokenizer_model_path is not None
   ), 'Exported tokenizer model path is not found.'
-  if tokenizer_model_path.endswith('.json'):
+  if (
+      export_config.tokenizer_format
+      == exportable_module_config.TokenizerFormat.HUGGING_FACE
+  ):
+    builder.add_hf_tokenizer(tokenizer_model_path)
+  elif (
+      export_config.tokenizer_format
+      == exportable_module_config.TokenizerFormat.SENTENCEPIECE
+  ):
+    builder.add_sentencepiece_tokenizer(tokenizer_model_path)
+  elif tokenizer_model_path.endswith('.json'):
     builder.add_hf_tokenizer(tokenizer_model_path)
   else:
     builder.add_sentencepiece_tokenizer(tokenizer_model_path)

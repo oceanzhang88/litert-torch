@@ -66,6 +66,13 @@ _MM_ADAPTER_MODEL_PATH = flags.DEFINE_string(
     None,
     'Path to the MM adapter model.',
 )
+_TRUST_REMOTE_CODE = flags.DEFINE_bool(
+    'trust_remote_code',
+    False,
+    'Allow a checkpoint that ships its architecture as remote code to be'
+    ' resolved. Required for models whose model_type transformers does not'
+    ' know, such as FastVLM, or the image preprocessor is never found.',
+)
 _SPM_PATH = flags.DEFINE_string(
     'spm_path',
     None,
@@ -167,6 +174,7 @@ def main(argv: Sequence[str]) -> None:
       enable_min_max_calibration_update=_ENABLE_MIN_MAX_CALIBRATION_UPDATE.value,
       ema_smoothing_factor=_EMA_SMOOTHING_FACTOR.value,
       use_profiler_based_calibration=_USE_PROFILER_BASED_CALIBRATION.value,
+      trust_remote_code=_TRUST_REMOTE_CODE.value,
   )
 
   print('--- Initializing executor. Loading models...')

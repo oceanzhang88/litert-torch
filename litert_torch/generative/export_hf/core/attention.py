@@ -19,10 +19,9 @@ from typing import Optional
 import jaxtyping as jt
 from litert_torch.generative.custom_ops import bmm_4d as bmm_lib
 from litert_torch.generative.export_hf.experimental.composites import sdpa as gpu_sdpa
+from litert_torch.generative.export_hf.core import softmax as softmax_lib
 import torch
-import torch.nn.functional as F
 import transformers
-from litert_torch.backend import composite
 
 
 def scaled_dot_product_attention_transposed(
@@ -36,6 +35,7 @@ def scaled_dot_product_attention_transposed(
     scale: Optional[float] = None,
     softcap: Optional[float] = None,
     alibi_bias: Optional[torch.Tensor] = None,
+    use_softmax_composite: bool = True,
 ):
   """Scaled dot product attention with transposed key and value.
 
@@ -50,6 +50,8 @@ def scaled_dot_product_attention_transposed(
     scale (float): the optional scale factor.
     softcap (float): the optional softcap for the logits.
     alibi_bias (torch.Tensor): optional alibi bias tensor.
+    use_softmax_composite (bool): whether to outline softmax as an ODML
+      StableHLO composite instead of keeping the builtin TFLite operator form.
 
   Returns:
     The output tensor of scaled_dot_product_attention_transposed.
@@ -89,13 +91,11 @@ def scaled_dot_product_attention_transposed(
     mask = torch.cat(mask_to_bc, dim=-2)  # 1, 1, gt, s
 
   padded_logits = logits + mask
-  attrs = {"axis": -1}
-  builder = composite.StableHLOCompositeBuilder(
-      name="odml.softmax", attr=attrs
+  probs = softmax_lib.apply_softmax(
+      padded_logits,
+      dim=-1,
+      use_composite=use_softmax_composite,
   )
-  padded_logits = builder.mark_inputs(padded_logits)
-  probs = F.softmax(padded_logits, dim=-1)
-  probs = builder.mark_outputs(probs)
   probs = probs.type_as(key)
   if v_ts_idx == 3:
     bmm_fn = bmm_lib.bmm_4d
@@ -147,6 +147,7 @@ def transposed_attention(
     )
 
   apply_gpu_composites = kwargs.get("apply_gpu_composites", False)
+  use_softmax_composite = kwargs.get("use_softmax_composite", True)
   if apply_gpu_composites:
     is_global = kwargs.get("is_global", None)
     if is_global is None:
@@ -164,6 +165,7 @@ def transposed_attention(
         softcap=softcap,
         param_tensor=kwargs.get("param_tensor", None),
         is_global=is_global,
+        use_softmax_composite=use_softmax_composite,
     )
     # b, kg, t, h
     sdpa_out = sdpa_out.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
@@ -180,6 +182,7 @@ def transposed_attention(
       mask=attention_mask,
       scale=scaling,
       softcap=softcap,
+      use_softmax_composite=use_softmax_composite,
   )
   # b, kg, t, h
   sdpa_out = sdpa_out.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)

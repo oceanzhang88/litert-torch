@@ -18,9 +18,9 @@ import math
 from typing import Optional
 
 from litert_torch.generative.custom_ops import bmm_4d as bmm_lib
+from litert_torch.generative.export_hf.core import softmax as softmax_lib
 from litert_torch.generative.export_hf.core.split_cache import cache as kv_cache_lib
 import torch
-import torch.nn.functional as F
 import transformers
 
 
@@ -34,6 +34,7 @@ def _scaled_dot_product_attention(
     mask: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     softcap: Optional[float] = None,
+    use_softmax_composite: bool = False,
 ):
   """Scaled dot product attention with transposed key and value.
 
@@ -47,6 +48,8 @@ def _scaled_dot_product_attention(
     mask (torch.Tensor): the optional mask tensor.
     scale (float): the optional scale factor.
     softcap (float): the optional softcap for the logits.
+    use_softmax_composite (bool): whether to outline softmax as an ODML
+      StableHLO composite. Split-cache keeps its historical builtin default.
 
   Returns:
     The output tensor of scaled_dot_product_attention_transposed.
@@ -87,7 +90,11 @@ def _scaled_dot_product_attention(
     mask = torch.cat(mask_to_bc, dim=-2)  # 1, 1, gt, s
 
   padded_logits = logits + mask
-  probs = F.softmax(padded_logits, dim=-1).type_as(key)
+  probs = softmax_lib.apply_softmax(
+      padded_logits,
+      dim=-1,
+      use_composite=use_softmax_composite,
+  ).type_as(key)
   probs0, probs1 = probs[..., :-t], probs[..., -t:]
 
   if v_ts_idx == 3:
@@ -140,6 +147,7 @@ def split_cache_attention(
       softcap=softcap,
       k_ts_idx=k_ts_idx,
       v_ts_idx=v_ts_idx,
+      use_softmax_composite=kwargs.get("use_softmax_composite", False),
   )  # 1, bk, gt, h
   sdpa_out = sdpa_out.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
   return sdpa_out, None

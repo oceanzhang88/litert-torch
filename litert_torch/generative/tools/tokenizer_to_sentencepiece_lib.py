@@ -29,9 +29,11 @@ to verify the quality of the built SentencePiece model.
 """
 
 import logging
+import os
 import random
 from typing import List
 
+from google.protobuf.message import DecodeError
 import transformers
 
 from sentencepiece import sentencepiece_model_pb2 as spm_model
@@ -188,6 +190,45 @@ def _build_spm_model_from_tokenizer(
   return sp_model
 
 
+def _load_sentencepiece_model(vocab_file) -> spm_model.ModelProto | None:
+  """Loads `vocab_file` only when its content is a SentencePiece model.
+
+  `vocab_file` is a Hugging Face tokenizer-constructor argument, not a file-type
+  guarantee. SentencePiece tokenizers conventionally put a ModelProto there,
+  while BPE tokenizers such as Qwen2 put `vocab.json` there. Treating every
+  truthy value as protobuf bytes sends valid JSON into `ModelProto.FromString`
+  and fails before the deterministic tokenizer reconstruction can run.
+
+  A successful protobuf parse alone is also insufficient because empty bytes
+  form a valid empty proto. A usable SentencePiece model must contain pieces.
+  """
+  if not isinstance(vocab_file, (str, os.PathLike)):
+    return None
+  vocab_file = os.fspath(vocab_file)
+  if not os.path.isfile(vocab_file):
+    return None
+
+  with open(vocab_file, "rb") as file:
+    serialized = file.read()
+  try:
+    model = spm_model.ModelProto.FromString(serialized)
+  except DecodeError:
+    logging.info(
+        "vocab_file is not a SentencePiece ModelProto; rebuilding from the"
+        " tokenizer: %s",
+        vocab_file,
+    )
+    return None
+  if not model.pieces:
+    logging.info(
+        "vocab_file parsed as an empty SentencePiece model; rebuilding from the"
+        " tokenizer: %s",
+        vocab_file,
+    )
+    return None
+  return model
+
+
 def _is_same_ids(ids_by_tokenizer: List[int], ids: List[int]) -> bool:
   """Checks if the IDs are the same to ones by transformer tokenizer."""
   # Transformer tokenizer may insert BOS token at the beginning.
@@ -270,12 +311,12 @@ def verify_spm_tokenizer(
 
 def convert(tokenizer, normalize_tokens: str = "decode"):
   """Converts a tokenizer to a SentencePieceModel protobuf."""
-  if hasattr(tokenizer, "vocab_file") and tokenizer.vocab_file:
-    logging.info("vocab_file exists: %s", tokenizer.vocab_file)
-    with open(tokenizer.vocab_file, "rb") as f:
-      sp_model = spm_model.ModelProto.FromString(f.read())
+  vocab_file = getattr(tokenizer, "vocab_file", None)
+  sp_model = _load_sentencepiece_model(vocab_file)
+  if sp_model is not None:
+    logging.info("Using SentencePiece ModelProto: %s", vocab_file)
   else:
-    logging.info("vocab_file does not exist. Try to build a new one.")
+    logging.info("Building SentencePiece ModelProto from tokenizer vocabulary.")
     sp_model = _build_spm_model_from_tokenizer(tokenizer, normalize_tokens)
 
   spm_serialized = sp_model.SerializeToString()

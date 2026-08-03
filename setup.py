@@ -91,7 +91,12 @@ setup(
         "tabulate",
         "torch>=2.4.0",
         "ai-edge-litert-nightly[model-utils]",
-        "ai-edge-quantizer-nightly",
+        # The owned fork, not the nightly. Both ship the package name
+        # `ai_edge_quantizer`, so installing the nightly alongside an
+        # editable checkout leaves the nightly's directory shadowing it as a
+        # namespace package -- the patched code is present on disk and never
+        # imported. One distribution, so which code runs is unambiguous.
+        "ai-edge-quantizer",
         "litert-converter>=0.0.0.dev0",
         "torchao>=0.17.0",
         "jax",

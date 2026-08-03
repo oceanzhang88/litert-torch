@@ -76,6 +76,11 @@ _TRANSFORMERS_MODEL_PATH = flags.DEFINE_string(
     None,
     'Path to the transformers model.',
 )
+_TRUST_REMOTE_CODE = flags.DEFINE_bool(
+    'trust_remote_code',
+    False,
+    'Whether to allow checkpoint-owned Transformers code.',
+)
 _PROMPT = flags.DEFINE_string(
     'prompt',
     None,
@@ -183,6 +188,7 @@ def main(argv: Sequence[str]) -> None:
       enable_calibration=_ENABLE_CALIBRATION.value,
       enable_min_max_calibration_update=_ENABLE_MIN_MAX_CALIBRATION_UPDATE.value,
       use_profiler_based_calibration=_USE_PROFILER_BASED_CALIBRATION.value,
+      trust_remote_code=_TRUST_REMOTE_CODE.value,
   )
 
   if _ENABLE_FORMATTING.value:

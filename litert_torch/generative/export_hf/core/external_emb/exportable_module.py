@@ -141,7 +141,6 @@ class LiteRTExportableModuleForEmbedder(torch.nn.Module):
     """Gets sample inputs."""
     del kwargs  # Unused.
     batch_size = export_config.batch_size
-    prefill_length = export_config.prefill_lengths[0]
     prefill_length_dim = export_config.prefill_length_dim
     del model_config  # Unused.
     tokens = {"token_ids": torch.ones((batch_size, 1), dtype=torch.int32)}
@@ -152,13 +151,23 @@ class LiteRTExportableModuleForEmbedder(torch.nn.Module):
       ret = {}
       ret["decode_embedder"] = (tokens, tokens_dynamic_shape)
 
-      tokens = {
-          "token_ids": torch.ones(
-              (batch_size, prefill_length), dtype=torch.int32
-          )
-      }
-      tokens_dynamic_shape = (
-          {"token_ids": {1: prefill_length_dim}} if prefill_length_dim else {}
-      )
-      ret[f"prefill_embedder_{prefill_length}"] = (tokens, tokens_dynamic_shape)
+      # One signature per prefill bucket, not just the first. Consumers pick a
+      # bucket per chunk -- the calibration executor infers the set from the
+      # text model's own `prefill_*` signatures and then asks the embedder for
+      # each one -- so exporting only `prefill_lengths[0]` leaves every other
+      # bucket unserviceable, and the failure is a missing signature key at
+      # load time rather than anything pointing back here.
+      for prefill_length in export_config.prefill_lengths:
+        prefill_tokens = {
+            "token_ids": torch.ones(
+                (batch_size, prefill_length), dtype=torch.int32
+            )
+        }
+        prefill_dynamic_shape = (
+            {"token_ids": {1: prefill_length_dim}} if prefill_length_dim else {}
+        )
+        ret[f"prefill_embedder_{prefill_length}"] = (
+            prefill_tokens,
+            prefill_dynamic_shape,
+        )
       return ret

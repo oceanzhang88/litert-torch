@@ -40,7 +40,13 @@ class ExportableModuleBase(torch.nn.Module, abc.ABC):
   def attention_kwargs(self):
     k_ts_idx = self.export_config.k_ts_idx
     v_ts_idx = self.export_config.v_ts_idx
-    return {"k_ts_idx": k_ts_idx, "v_ts_idx": v_ts_idx}
+    kwargs = {
+        "k_ts_idx": k_ts_idx,
+        "v_ts_idx": v_ts_idx,
+    }
+    if self.export_config.use_softmax_composite is not None:
+      kwargs["use_softmax_composite"] = self.export_config.use_softmax_composite
+    return kwargs
 
   @abc.abstractmethod
   def get_sample_inputs(
@@ -135,7 +141,10 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
           is not None
       ):
         pad_token_id = self.source_model_artifacts.tokenizer.pad_token_id
-      if pad_token_id is None and getattr(text_config, "pad_token_id", None) is not None:
+      if (
+          pad_token_id is None
+          and getattr(text_config, "pad_token_id", None) is not None
+      ):
         pad_token_id = text_config.pad_token_id
       if not isinstance(pad_token_id, int) or pad_token_id < 0:
         pad_token_id = 0

@@ -189,19 +189,65 @@ def generate_causal_left(
   return causal_mask
 
 
+# How far below a real logit a masked position is pushed.
+#
+# This mask is additive and consumed by a softmax, so a masked position is only
+# suppressed to the extent that `fill` outweighs the spread of the real logits
+# in its row. The requirement is therefore
+#
+#     |fill| > (max_logit - min_logit) + ~40
+#
+# (exp(-40) is ~4e-18, well under float32 resolution), which is a property of
+# the *checkpoint*, not of the mask. Architectures with massive activations put
+# far more pressure on it than the value this defaulted to for its first few
+# models: FastVLM-1.5B (Qwen2-1.5B) reaches attention logits in the thousands at
+# layer 0, and the previous -100.0 left masked positions fully competitive in
+# the softmax. Measured against HuggingFace's KV, per-layer cosine over the 28
+# layers moved as the fill deepened:
+#
+#     fill      K median   V median
+#     -100        0.9296     0.7527     <- shipped; pad/future tokens leak
+#     -1e3        0.9395     0.7879
+#     -2e3        0.9628     0.8648
+#     -3.5e3      0.9937     0.9796
+#     -4e3        1.0000     1.0000     <- threshold
+#     -1e4        1.0000     1.0000     <- 1.5B recipe, 2.5x margin
+#
+# The value is not simply set to -inf because the auxiliary graph emits this
+# mask as int16 for the NPU, and the fused add's output scale must span it: the
+# softmax input's quantization step is ~|fill|/32767, so an enormous fill trades
+# a masking bug for a precision one. Measured on the shipped bundle, -1e4 puts
+# the mask tensor's step at 0.351 and roughly doubles layer 0's softmax input
+# step, 0.409 -> 0.756.
+#
+# That cost is real but is not what limits the quantized model: with this fill
+# in place, layer 0 -- which carries the *coarsest* softmax input in the graph
+# -- still scores 0.99994 against the source model, and the drift that remains
+# accumulates with depth rather than appearing where the step is widest. So the
+# margin is kept rather than spent chasing a precision problem the measurement
+# does not support.
+#
+# There is no safe universal production value: FastVLM-0.5B needs the finer
+# int16 scale produced by -100, while FastVLM-1.5B needs -1e4 to suppress its
+# much larger attention logits. Keep the historical -100 compatibility default
+# for direct callers, and make exporters pass a recipe/model-owned value.
+DEFAULT_MASK_FILL = -100.0
+
+
 def build_full_mask(
     input_tokens: torch.Tensor,
     W: int | None,  # pylint: disable=invalid-name
     S: int,  # pylint: disable=invalid-name
     time_step: torch.Tensor,
     valid_mask: torch.Tensor,
+    mask_fill: float = DEFAULT_MASK_FILL,
 ):
   """Builds full attention mask."""
   left_mask = generate_causal_left(input_tokens, W, S, time_step)
   right_mask = generate_causal_right(input_tokens, W, valid_mask)
 
   mask = torch.cat([left_mask, right_mask], dim=-1)
-  mask = torch.logical_not(mask.unsqueeze(0).unsqueeze(0)) * -100.0
+  mask = torch.logical_not(mask.unsqueeze(0).unsqueeze(0)) * mask_fill
   return mask
 
 
@@ -212,10 +258,12 @@ class SplitAttentionMask(nn.Module):
       self,
       context_size: int,
       sliding_window_size: int | None = None,
+      mask_fill: float = DEFAULT_MASK_FILL,
   ):
     super().__init__()
     self.context_size = context_size
     self.sliding_window_size = sliding_window_size
+    self.mask_fill = mask_fill
 
   def forward(self, input_tokens, time_step, valid_mask):
     # input_tokens: [1, T]
@@ -227,4 +275,5 @@ class SplitAttentionMask(nn.Module):
         self.context_size,
         time_step,
         valid_mask,
+        self.mask_fill,
     )

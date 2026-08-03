@@ -30,12 +30,47 @@ from litert_torch.generative.export_hf.core import litert_lm_builder
 ExportTask = exportable_module_config.ExportTask
 
 
+def split_config_args(
+    provided_args: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+  """Splits caller arguments into config fields and passthrough extras.
+
+  Callers that assemble an `ExportableModuleConfig` outside `export()` -- a
+  staged flow packaging already-quantized graphs, for instance -- have to route
+  arguments the same way `export()` does, or a field silently lands in
+  `extra_kwargs` and never takes effect. One implementation, so the two cannot
+  drift.
+  """
+  valid_fields = {
+      f.name
+      for f in dataclasses.fields(exportable_module.ExportableModuleConfig)
+  }
+  config_args = {}
+  extra_args = {}
+  for key, value in provided_args.items():
+    if key in valid_fields:
+      config_args[key] = value
+    else:
+      extra_args[key] = value
+  return config_args, extra_args
+
+
 @progress.task('LiteRT GenAI Export')
 def run_export_tasks(
     export_tasks,
     export_config: exportable_module.ExportableModuleConfig,
+    seed_artifacts: export_lib.ExportedModelArtifacts | None = None,
 ) -> export_lib.ExportedModelArtifacts:
-  """Runs export tasks."""
+  """Runs export tasks.
+
+  `seed_artifacts` lets a caller run a subset of the tasks against graphs that
+  already exist on disk. Static-range quantization cannot happen during export
+  -- `quantize_model` takes a recipe and no calibration ranges -- so a
+  calibrated flow necessarily converts to float first, measures, quantizes out
+  of band, and only then wants the packaging tasks. Without a seed those tasks
+  would start from an empty artifact set and re-export every graph in float,
+  silently bundling the unquantized model.
+  """
   model_path = export_config.model
   trust_remote_code = export_config.trust_remote_code
   auto_model_override = export_config.auto_model_override
@@ -51,7 +86,11 @@ def run_export_tasks(
       export_config, source_model_artifacts
   )
 
-  exported_model_artifacts = export_lib.ExportedModelArtifacts()
+  exported_model_artifacts = (
+      seed_artifacts
+      if seed_artifacts is not None
+      else export_lib.ExportedModelArtifacts()
+  )
 
   # Suppress deprecation warnings to be compatible with older PyTorch.
   with warnings.catch_warnings():
@@ -91,11 +130,13 @@ def export(
     enable_gpu_dynamic_prefill: bool | None = None,
     enable_gpu_dynamic_cache: bool | None = None,
     use_rope_composite: bool | None = None,
+    use_softmax_composite: bool | None = None,
     externalize_embedder: bool | None = None,
     single_token_embedder: bool | None = None,
     k_ts_idx: int | None = None,
     v_ts_idx: int | None = None,
     split_cache: bool | None = None,
+    split_cache_mask_fill: float | None = None,
     cache_implementation: str | None = None,
     auto_model_override: str | None = None,
     use_jinja_template: bool | None = None,
@@ -103,11 +144,16 @@ def export(
     experimental_use_mixed_precision: bool | None = None,
     export_vision_encoder: bool | None = None,
     vision_encoder_quantization_recipe: str | None = None,
+    export_calibration_embedder: bool | None = None,
+    block_embedder_quantization_recipe: str | None = None,
     export_audio_encoder: bool | None = None,
     input_sec: float | None = None,
     stateful_after: int | None = None,
     litert_lm_model_type_override: str | None = None,
     litert_lm_llm_metadata_override: str | None = None,
+    tokenizer_format: (
+        exportable_module_config.TokenizerFormat | str | None
+    ) = None,
     sampler_top_p: float | None = None,
     sampler_temperature: float | None = None,
     sampler_top_k: int | None = None,
@@ -138,11 +184,16 @@ def export(
     enable_gpu_dynamic_cache: Whether to enable GPU dynamic shapes (magic
       numbers) for cache length.
     use_rope_composite: Whether to enable the RoPE composite.
+    use_softmax_composite: Whether to outline attention softmax as an
+      odml.softmax StableHLO composite. Set false for runtimes that require a
+      builtin TFLite SOFTMAX in the signature graph.
     externalize_embedder: Whether to externalize the embedder.
     single_token_embedder: Whether to use a single token embedder.
     k_ts_idx: The index of time step dimension in the key tensor.
     v_ts_idx: The index of time step dimension in the value tensor.
     split_cache: Whether to use split cache attention.
+    split_cache_mask_fill: Additive value for masked positions in the
+      split-cache auxiliary graph. This should be selected per checkpoint.
     cache_implementation: The cache implementation to use.
     auto_model_override: Overriding the AutoModel class to use for export.
     use_jinja_template: Whether to use jinja template.
@@ -151,12 +202,18 @@ def export(
     export_vision_encoder: Whether to export the vision encoder.
     vision_encoder_quantization_recipe: The quantization recipe to use for the
       vision encoder.
+    export_calibration_embedder: Whether to retain a float block-signature
+      embedder for calibration.
+    block_embedder_quantization_recipe: If set, quantize a separate copy of the
+      block-signature embedder with this recipe and package that copy.
     export_audio_encoder: Whether to export the audio encoder.
     input_sec: Input audio length in seconds.
     stateful_after: If >= 0, the model runs in stateful mode after this many
       tokens.
     litert_lm_model_type_override: Overriding the LiteRT LM model type.
     litert_lm_llm_metadata_override: Overriding the LiteRT LM LLM metadata.
+    tokenizer_format: Tokenizer representation to package: auto, hugging_face,
+      or sentencepiece.
     **kwargs: Additional keyword arguments to pass to the exportable module
       config.
   """
@@ -173,17 +230,7 @@ def export(
   else:
     work_dir = output_dir
 
-  valid_fields = {
-      f.name
-      for f in dataclasses.fields(exportable_module.ExportableModuleConfig)
-  }
-  config_args = {}
-  extra_args = {}
-  for key, value in provided_args.items():
-    if key in valid_fields:
-      config_args[key] = value
-    else:
-      extra_args[key] = value
+  config_args, extra_args = split_config_args(provided_args)
 
   export_config = exportable_module.ExportableModuleConfig(
       model=model,
@@ -207,7 +254,12 @@ def export(
     if export_config.aot_backend is not None:
       export_tasks.append(export_lib.aot_compile_model)
     if export_config.externalize_embedder:
-      export_tasks.append(export_lib.export_embedder_model)
+      if not export_config.block_embedder_quantization_recipe:
+        export_tasks.append(export_lib.export_embedder_model)
+      if export_config.export_calibration_embedder:
+        export_tasks.append(export_lib.export_calibration_embedder_model)
+      if export_config.block_embedder_quantization_recipe:
+        export_tasks.append(export_lib.prepare_shipped_block_embedder_model)
     if export_config.split_cache:
       export_tasks.append(export_lib.export_auxiliary_model)
     export_tasks.append(export_lib.export_additional_models)
@@ -230,3 +282,9 @@ def export(
       'Export complete. Model saved to:'
       f' {exported_model_artifacts.litert_lm_model_path or output_dir}'
   )
+  # `run_export_tasks` builds the paths every later stage needs --
+  # prefill/decode, embedder, tokenizer, the two vision graphs -- and dropping
+  # them on the floor leaves callers reconstructing filenames by convention.
+  # Staged flows (calibrate -> merge -> quantize) have to address these
+  # artifacts by path, so return what was already computed.
+  return exported_model_artifacts

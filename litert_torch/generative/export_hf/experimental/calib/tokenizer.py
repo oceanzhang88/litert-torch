@@ -55,9 +55,14 @@ class Request:
 class TokenizerConfig:
   vocab_path: str | None = None
   transformers_model_path: str | None = None
+  trust_remote_code: bool = False
 
   def make(self) -> 'Tokenizer':
-    return Tokenizer(self.vocab_path, self.transformers_model_path)
+    return Tokenizer(
+        self.vocab_path,
+        self.transformers_model_path,
+        trust_remote_code=self.trust_remote_code,
+    )
 
 
 class Tokenizer:
@@ -67,6 +72,7 @@ class Tokenizer:
       self,
       spm_model_path: str | None = None,
       transformers_model_path: str | None = None,
+      trust_remote_code: bool = False,
   ):
     if spm_model_path:
       self.spm = spm.SentencePieceProcessor()
@@ -74,7 +80,7 @@ class Tokenizer:
       self.tx_tokenizer = None
     elif transformers_model_path:
       self.tx_tokenizer = transformers.AutoTokenizer.from_pretrained(
-          transformers_model_path
+          transformers_model_path, trust_remote_code=trust_remote_code
       )
       self.spm = None
     else:
@@ -82,7 +88,13 @@ class Tokenizer:
           'Must specify either spm_model_path or transformers_model_path.'
       )
     if transformers_model_path:
-      config = transformers.AutoConfig.from_pretrained(transformers_model_path)
+      # A checkpoint that ships its architecture as remote code -- FastVLM's
+      # `llava_qwen2`, for instance -- has a model_type transformers does not
+      # know, so AutoConfig refuses to resolve it without this. That refusal is
+      # what decides whether an image preprocessor is found at all.
+      config = transformers.AutoConfig.from_pretrained(
+          transformers_model_path, trust_remote_code=trust_remote_code
+      )
       image_preprocessor_cls = IMAGE_PREPREOCESSORS.get(config.model_type, None)
       if image_preprocessor_cls:
         self._image_preprocessor = image_preprocessor_cls(
@@ -180,9 +192,16 @@ class Tokenizer:
             self._image_preprocessor
             and self._image_preprocessor.num_tokens_per_image
         ), 'num_tokens_per_image must be specified for image requests.'
-        ids.append(self._image_preprocessor.special_tokens.get('soi', None))
-        index_media.append(-1)
-        index_feat_in_media.append(-1)
+        # Not every architecture brackets images with delimiter tokens. LLaVA
+        # derivatives mark the position with a placeholder index instead and
+        # have no `<|image_start|>`/`<|image_end|>` in their vocabulary, so
+        # `.get()` returns None -- and appending that makes the id array object
+        # dtype, which blows up on `.astype(np.int32)` rather than saying why.
+        soi = self._image_preprocessor.special_tokens.get('soi', None)
+        if soi is not None:
+          ids.append(soi)
+          index_media.append(-1)
+          index_feat_in_media.append(-1)
 
         ids += [-2] * self._image_preprocessor.num_tokens_per_image
         index_media += [len(images)] * (
@@ -192,9 +211,11 @@ class Tokenizer:
             range(self._image_preprocessor.num_tokens_per_image)
         )
 
-        ids.append(self._image_preprocessor.special_tokens.get('eoi', None))
-        index_media.append(-1)
-        index_feat_in_media.append(-1)
+        eoi = self._image_preprocessor.special_tokens.get('eoi', None)
+        if eoi is not None:
+          ids.append(eoi)
+          index_media.append(-1)
+          index_feat_in_media.append(-1)
 
         images.append(item)
       else:
@@ -261,6 +282,68 @@ def interleave_media_features_in_text(
   output[batch_indices, seq_indices] = features_to_insert
 
   return output
+
+
+@_register_image_preprocessor('llava_qwen2')
+class FastVlmImagePreprocessor:
+  """FastVLM (llava_qwen2) image preprocessor.
+
+  Without an entry in this registry the lookup returns None, images are dropped
+  in silence, and calibration measures a vision-language model that never saw a
+  picture -- then the kernels get built around those ranges.
+
+  The processor is rebuilt here rather than loaded with `AutoImageProcessor`:
+  FastVLM keeps no `preprocessor_config.json`, it constructs a
+  `CLIPImageProcessor` inside its vision tower at load time. These values are
+  copied from that constructor (`llava_qwen.py`, `MobileCLIPVisionTower`), where
+  the normalization is deliberately the identity -- mean 0, std 1. Substituting
+  CLIP's usual statistics would look reasonable and be quietly wrong.
+  """
+
+  def __init__(
+      self,
+      transformers_model_path: str,
+      tokenizer: 'Tokenizer',
+  ):
+    self.parent = tokenizer
+    self.transformers_model_path = transformers_model_path
+
+    config = transformers.AutoConfig.from_pretrained(
+        transformers_model_path, trust_remote_code=True
+    )
+    # `mobileclip_l_1024` -> 1024, the same parse the vision tower does.
+    resolution = int(str(config.mm_vision_tower).split('_')[-1])
+    # 1024 / 64 = 16 patches a side, 16 * 16 = 256 soft tokens per image.
+    self.num_tokens_per_image = (resolution // 64) ** 2
+    self.pre_preprocess_image_res = resolution
+
+    self.processor = transformers.CLIPImageProcessor(
+        crop_size={'height': resolution, 'width': resolution},
+        image_mean=[0.0, 0.0, 0.0],
+        image_std=[1.0, 1.0, 1.0],
+        size={'shortest_edge': resolution},
+    )
+    # LLaVA derivatives carry no image delimiter tokens; the position is marked
+    # by a placeholder index instead.
+    self.special_tokens = {}
+
+  def __call__(self, image_bytes: bytes) -> dict[str, np.ndarray]:
+    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    target_shape = (
+        self.pre_preprocess_image_res,
+        self.pre_preprocess_image_res,
+    )
+    image = image.resize(target_shape, resample=Image.Resampling.LANCZOS)
+    processed_image = self.processor(image, return_tensors='np').pixel_values
+    # NCHW -> NHWC, matching the exported vision graph and what LiteRT-LM
+    # feeds it on device. `pixel_values` is PyTorch-native NCHW, but the
+    # runtime reads the encoder's trailing dimension as the channel count and
+    # refuses anything outside 3..4, so the graph takes NHWC and transposes
+    # inside. Calibration must feed the graph the way the device will --
+    # here it does not even get that far: XNNPack fails to reshape the first
+    # convolution and the stage exits 1.
+    processed_image = np.transpose(processed_image, (0, 2, 3, 1))
+    return {'images': np.ascontiguousarray(processed_image)}
 
 
 @_register_image_preprocessor('lfm2_vl')
