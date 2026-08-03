@@ -348,6 +348,7 @@ def compile_litertlm(
     disable_aux_compilation: bool = False,
     intermediate_dir: str | pathlib.Path | None = None,
     keep_temporary_files: bool = False,
+    overwrite: bool = True,
 ) -> None:
   """Compiles LiteRT-LM models inside a package for the target NPU.
 
@@ -361,11 +362,26 @@ def compile_litertlm(
     model_name: Optional model name to resolve model-specific default configs.
     disable_weight_sharing: If True, disables weight sharing for Qualcomm.
     disable_aux_compilation: If True, disables compiling auxiliary model.
+    intermediate_dir: If set, intermediate artifacts will be stored here. If not
+      set and keep_temporary_files is True, intermediate artifacts will be
+      stored in a temporary directory.
+    keep_temporary_files: If True, keep intermediate artifacts.
+    overwrite: If True, overwrite existing output file. If False, raise an error
+      if the output file already exists.
 
   Raises:
     ValueError: If compile options are invalid.
     RuntimeError: If compilation fails.
   """
+  if (
+      overwrite
+      and output_litertlm
+      and isinstance(output_litertlm, pathlib.Path)
+  ):
+    if output_litertlm.exists():
+      output_litertlm.unlink()
+  elif overwrite and output_litertlm and os.path.exists(str(output_litertlm)):
+    os.remove(str(output_litertlm))
   configs = {}
   if compile_configs:
     if isinstance(compile_configs, dict):
@@ -460,9 +476,9 @@ def compile_litertlm(
               extra_flags = list(configs[model_type])
             elif isinstance(configs[model_type], dict):
               should_compile = configs[model_type].get('compile', True)
-              raw_flags = configs[model_type].get('flags', [])
-              if isinstance(raw_flags, list):
-                extra_flags = list(raw_flags)
+              flags_val = configs[model_type].get('flags', [])
+              if isinstance(flags_val, list):
+                extra_flags = list(flags_val)
 
           if (
               should_compile

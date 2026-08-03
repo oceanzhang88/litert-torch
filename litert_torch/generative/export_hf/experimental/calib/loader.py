@@ -14,9 +14,11 @@
 # ==============================================================================
 """Loader for models."""
 
+import tempfile
 from typing import Tuple
 from litert_torch.generative.export_hf.experimental.calib import sampling_executor as tfl_sampling_executor
 from litert_torch.generative.export_hf.experimental.calib import tokenizer as tokenizer_lib
+from litert_torch.generative.export_hf.experimental.litertlm_bundle import litertlm_bundle as litertlm_utils
 
 
 def _infer_model_specs(
@@ -42,8 +44,8 @@ def _infer_drafter_step(decode_model_path: str):
 
 
 def load_models(
-    model_path: str | Tuple[str, str],
-    embedder_model_path: str,
+    model_path: str | Tuple[str, str] | None,
+    embedder_model_path: str | None,
     spm_path: str | None,
     transformers_model_path: str | None,
     max_kv_cache_size: int | None,
@@ -58,9 +60,49 @@ def load_models(
     enable_min_max_calibration_update: bool = True,
     ema_smoothing_factor: float = 0.95,
     use_profiler_based_calibration: bool = False,
+    input_litertlm: str | None = None,
     trust_remote_code: bool = False,
 ) -> tfl_sampling_executor.TflSamplingExecutorConfig:
   """Loads the models."""
+  unpacked = None
+  if input_litertlm or (
+      isinstance(model_path, str) and model_path.endswith('.litertlm')
+  ):
+    bundle_path = input_litertlm or model_path
+    assert isinstance(bundle_path, str)
+    unpack_dir = tempfile.mkdtemp(prefix='litertlm_unpacked_')
+    unpacked = litertlm_utils.unpack_litertlm(bundle_path, unpack_dir)
+    if (
+        not model_path
+        or model_path == (None, None)
+        or (isinstance(model_path, str) and model_path == bundle_path)
+        or (
+            isinstance(model_path, tuple)
+            and model_path[0] is None
+            and model_path[1] is None
+        )
+    ):
+      model_path = unpacked.get('tf_lite_prefill_decode')
+    if not embedder_model_path:
+      embedder_model_path = unpacked.get('tf_lite_embedder')
+    if not auxiliary_model_path:
+      auxiliary_model_path = unpacked.get('tf_lite_aux')
+    if not per_layer_embedder_model_path:
+      per_layer_embedder_model_path = unpacked.get('tf_lite_per_layer_embedder')
+    if not spm_path and not transformers_model_path:
+      spm_path = unpacked.get('SP_Tokenizer')
+      transformers_model_path = unpacked.get('transformers_model_path')
+
+  if not model_path:
+    raise ValueError(
+        'Must specify model_path or provide a valid input_litertlm bundle.'
+    )
+  if not embedder_model_path:
+    raise ValueError(
+        'Must specify embedder_model_path or include embedder in'
+        ' input_litertlm.'
+    )
+
   if isinstance(model_path, tuple):
     prefill_model_path, decode_model_path = model_path
     decode_model_path = decode_model_path or prefill_model_path
@@ -159,7 +201,16 @@ def load_models(
   )
   tokenizer_config = tokenizer_lib.TokenizerConfig(
       vocab_path=spm_path,
+      # Passed through even on the bundle lane. Tokenization itself prefers
+      # `tokenizer_json_path` when the bundle carries one, but the tokenizer
+      # gates its image preprocessor on `transformers_model_path` being set --
+      # dropping it here would silently disable the FastVLM vision path for
+      # every .litertlm run and calibrate a VLM that never saw a picture.
       transformers_model_path=transformers_model_path,
+      tokenizer_json_path=unpacked.get('tokenizer_json_path')
+      if unpacked
+      else None,
+      chat_template=unpacked.get('chat_template') if unpacked else None,
       trust_remote_code=trust_remote_code,
   )
   return tfl_sampling_executor.TflSamplingExecutorConfig(
@@ -183,4 +234,5 @@ def load_models(
       enable_min_max_calibration_update=enable_min_max_calibration_update,
       ema_smoothing_factor=ema_smoothing_factor,
       use_profiler_based_calibration=use_profiler_based_calibration,
+      stop_tokens=unpacked.get('stop_token_ids') if unpacked else None,
   )

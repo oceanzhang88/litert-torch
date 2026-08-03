@@ -144,7 +144,25 @@ def get_example_prompt(
     tokenizer: tokenizer_lib.Tokenizer | None = None,
 ) -> str | tokenizer_lib.Request:
   """Gets the prompt from the example."""
+  if isinstance(example, str):
+    prompt = example
+    if enable_formatting:
+      prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
+    return prompt
+
   if isinstance(example, dict):
+    if 'text' in example and isinstance(example['text'], str):
+      prompt = example['text']
+      if enable_formatting:
+        prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
+      return prompt
+
+    if 'prompt' in example and isinstance(example['prompt'], str):
+      prompt = example['prompt']
+      if enable_formatting:
+        prompt = PROMPT_TEMPLATE_PREFIX + prompt + PROMPT_TEMPLATE_SUFFIX
+      return prompt
+
     if 'messages' in example:
       user_messages = [
           msg for msg in example['messages'] if msg.get('role') == 'user'
@@ -155,6 +173,7 @@ def get_example_prompt(
             tokenize=False,
             add_generation_prompt=True,
         )
+        assert isinstance(prompt, str)
         print(f'\n--- Formatted prompt using chat template:\n{prompt}\n---')
         return prompt
       else:
