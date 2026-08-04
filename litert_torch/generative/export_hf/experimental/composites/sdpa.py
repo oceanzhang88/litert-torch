@@ -41,6 +41,7 @@ def scaled_dot_product_attention_transposed(
     param_tensor: Optional[torch.Tensor] = None,
     is_global: bool = False,
     use_softmax_composite: bool = True,
+    sdpa_use_composite: bool = True,
 ):
   """Scaled dot product attention with transposed key and value.
 
@@ -59,6 +60,7 @@ def scaled_dot_product_attention_transposed(
     is_global (bool): whether the attention is global.
     use_softmax_composite (bool): whether to outline softmax as an ODML
       StableHLO composite instead of keeping the builtin TFLite operator form.
+    sdpa_use_composite (bool): whether to use composite for SDPA.
 
   Returns:
     The output tensor of scaled_dot_product_attention_transposed.
@@ -77,9 +79,46 @@ def scaled_dot_product_attention_transposed(
 
   assert mask is not None, "Mask should not be None!"
   t = mask.shape[2]
+  gt = query.shape[2]
+  g = gt // t
+
+  # broadcasting mask
+  if param_tensor is not None:
+    if mask.dtype != torch.bool:
+      mask: torch.Tensor = mask == 0
+    if g != 1:
+      mask = mask.to(torch.float32)  # pyrefly: ignore[missing-attribute]
+      mask = torch.cat([mask] * g, dim=1)
+      mask: torch.Tensor = mask != 0
+      mask = mask.reshape(1, 1, gt, -1)  # pyrefly: ignore[missing-attribute]
+  else:
+    if g != 1:
+      mask_to_bc = []
+      for _ in range(g):
+        mask_to_bc.append(mask)
+      mask = torch.cat(mask_to_bc, dim=-2)  # 1, 1, gt, s
+
+  attrs = {}
+  attrs.update({
+      "k_ts_idx": k_ts_idx,
+      "v_ts_idx": v_ts_idx,
+  })
+  if softcap is not None:
+    attrs["softcap"] = softcap
+  if sdpa_use_composite:
+    sdpa_builder = composite.StableHLOCompositeBuilder(
+        name="odml.sdpa_transposed", attr=attrs
+    )
+    query, key, value, mask, param_tensor = sdpa_builder.mark_inputs(
+        query, key, value, mask, param_tensor
+    )
+  else:
+    sdpa_builder = None
+
   if param_tensor is not None:
     bmm_fn = lambda x, y: runtime_batched_matmul.runtime_bmm(
-        x, y, param_tensor, is_global=is_global, is_src=False
+        x, y, param_tensor, is_global=is_global, is_src=False,
+        use_composite=not sdpa_use_composite,
     )
   elif k_ts_idx == 2:
     bmm_fn = bmm_lib.bmm_4d
@@ -88,37 +127,16 @@ def scaled_dot_product_attention_transposed(
     bmm_fn = lambda x, y: torch.einsum("abth,abhs->abts", x, y)
   logits = bmm_fn(query, key)
 
-  _, _, gt, _ = logits.shape
-  g = gt // t
   if softcap is not None:
     logits = torch.tanh(logits / softcap)
     logits = logits * softcap
 
-  # broadcasting mask
-  if param_tensor is not None:
-    if mask.dtype != torch.bool:
-      mask = mask == 0
-    if g != 1:
-      mask = mask.to(torch.float32)  # pyrefly: ignore[missing-attribute]
-      mask = torch.cat([mask] * g, dim=1)
-      mask = mask != 0
-      mask = mask.reshape(1, 1, gt, -1)  # pyrefly: ignore[missing-attribute]
+  if mask.dtype == torch.bool:
     padded_logits = torch.where(
         mask, logits, torch.tensor(MASK_FILL_VALUE, dtype=logits.dtype)
     )
   else:
-    if g != 1:
-      mask_to_bc = []
-      for _ in range(g):
-        mask_to_bc.append(mask)
-      mask = torch.cat(mask_to_bc, dim=-2)  # 1, 1, gt, s
-
-    if mask.dtype == torch.bool:
-      padded_logits = torch.where(
-          mask, logits, torch.tensor(MASK_FILL_VALUE, dtype=logits.dtype)
-      )
-    else:
-      padded_logits = logits + mask
+    padded_logits = logits + mask
 
   probs = softmax_lib.apply_softmax(
       padded_logits,
@@ -128,7 +146,8 @@ def scaled_dot_product_attention_transposed(
   probs = probs.type_as(key)
   if param_tensor is not None:
     bmm_fn = lambda x, y: runtime_batched_matmul.runtime_bmm(
-        x, y, param_tensor, is_global=is_global, is_src=True
+        x, y, param_tensor, is_global=is_global, is_src=True,
+        use_composite=not sdpa_use_composite,
     )
   elif v_ts_idx == 3:
     bmm_fn = bmm_lib.bmm_4d
@@ -136,5 +155,7 @@ def scaled_dot_product_attention_transposed(
     assert v_ts_idx == 2, "v_ts_idx must be 2 or 3."
     bmm_fn = lambda x, y: torch.einsum("abts,absh->abth", x, y)
   encoded = bmm_fn(probs, value)
+  if sdpa_builder is not None:
+    encoded = sdpa_builder.mark_outputs(encoded)
 
   return encoded  # 1, bk, gt, h

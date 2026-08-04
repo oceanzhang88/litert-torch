@@ -14,12 +14,14 @@
 # ==============================================================================
 """Tests for Gemma4 model export patches."""
 
-from absl.testing import parameterized
-from litert_torch.generative.export_hf.core import exportable_module_config
-from litert_torch.generative.export_hf.model_ext.gemma4 import patch
-from litert_torch.generative.layers import rotary_position_embedding as rotary_pos_emb
 import torch
 from transformers.models.gemma4 import modeling_gemma4
+from absl.testing import parameterized
+import litert_torch.generative.export_hf
+from litert_torch.generative.export_hf.core import exportable_module_config
+from litert_torch.generative.export_hf.model_ext.gemma4 import patch
+from litert_torch.generative.layers import moe
+from litert_torch.generative.layers import rotary_position_embedding as rotary_pos_emb
 
 from absl.testing import absltest as googletest
 
@@ -210,6 +212,42 @@ class PatchTest(parameterized.TestCase):
     )
     self.assertIsInstance(
         model.model.layers[0].self_attn, modeling_gemma4.Gemma4TextAttention
+    )
+
+  def test_gemma4_experts_litert_moe_equivalence(self):
+    config = _get_dummy_gemma4_text_config()
+    config.num_experts = 4
+    config.top_k_experts = 2
+    config.moe_intermediate_size = 32
+
+    torch.manual_seed(42)
+    experts = modeling_gemma4.Gemma4TextExperts(config)
+    experts.config = config
+    with torch.no_grad():
+      experts.gate_up_proj.normal_()
+      experts.down_proj.normal_()
+
+    batch_size = 2
+    seq_len = 5
+    hidden_states = torch.randn(batch_size * seq_len, config.hidden_size)
+    top_k_index = torch.randint(
+        0, config.num_experts, (batch_size * seq_len, config.top_k_experts)
+    )
+    top_k_weights = torch.softmax(
+        torch.randn(batch_size * seq_len, config.top_k_experts), dim=-1
+    )
+
+    with torch.no_grad():
+      expected_output = experts(hidden_states, top_k_index, top_k_weights)
+      actual_output = moe.litert_moe_experts_forward(
+          experts, hidden_states, top_k_index, top_k_weights
+      )
+
+    self.assertTrue(
+        torch.allclose(expected_output, actual_output, rtol=1e-4, atol=1e-4),
+        "Gemma4TextExperts vs litert_moe_experts_forward mismatch.\n"
+        f"Max diff: {(expected_output - actual_output).abs().max().item()}\n"
+        f"Expected: {expected_output}\nActual: {actual_output}",
     )
 
 

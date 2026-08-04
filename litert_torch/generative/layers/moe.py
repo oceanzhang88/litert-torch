@@ -122,7 +122,7 @@ def _moe_experts_reference(
   selected_linear = linear_w[indices]
   gate = torch.einsum("bskhd,bsd->bskh", selected_gate, src_flat)
   ff1 = torch.einsum("bskhd,bsd->bskh", selected_ff1, src_flat)
-  hidden = F.gelu(gate) * ff1
+  hidden = F.gelu(gate, approximate="tanh") * ff1
   expert_output = torch.einsum("bskdh,bskh->bskd", selected_linear, hidden)
   scale = per_expert_scale.reshape(num_experts)[indices].to(torch.float32)
   expert_output = expert_output * scale.unsqueeze(-1)

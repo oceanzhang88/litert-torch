@@ -24,17 +24,23 @@ def runtime_bmm(
     param_tensor: torch.Tensor,
     is_global: bool = False,
     is_src: bool = False,
+    use_composite: bool = True,
 ) -> torch.Tensor:
   """Runtime BMM composite op."""
-  attrs = {
-      "is_global": is_global,
-      "is_src": is_src,
-      "rhs_cache_update": True,  # If input is coming from cache_update custom.
-  }
-  builder = composite.StableHLOCompositeBuilder(
-      name="odml.runtime_bmm", attr=attrs
-  )
-  a, b, param_tensor = builder.mark_inputs(a, b, param_tensor)
+  if use_composite:
+    attrs = {
+        "is_global": is_global,
+        "is_src": is_src,
+        "rhs_cache_update": True,  # If input is coming from cache_update custom
+    }
+    builder = composite.StableHLOCompositeBuilder(
+        name="odml.runtime_bmm", attr=attrs
+    )
+    a, b, param_tensor = builder.mark_inputs(a, b, param_tensor)
+  else:
+    builder = None
 
   out = torch.einsum("abcd,abed->abce", a, b) + (param_tensor.sum() * 0)
-  return builder.mark_outputs(out)
+  if builder is not None:
+    out = builder.mark_outputs(out)
+  return out

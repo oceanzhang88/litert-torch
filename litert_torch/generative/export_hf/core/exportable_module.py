@@ -164,13 +164,17 @@ class LiteRTExportableModuleForDecoderOnlyLM(ExportableModuleBase):
       ret["valid_mask"] = valid_mask
 
     cache_runtime_args = {"cache_position": input_pos}
-    if kwargs.get("apply_gpu_composites", False):
+    if kwargs.get("apply_gpu_composites", False) or kwargs.get(
+        "sdpa_use_composite", False
+    ):
       param_tensor = kwargs.get("param_tensor", None)
       cache_runtime_args["apply_gpu_composites"] = True
       cache_runtime_args["param_tensor"] = param_tensor
       ret["apply_gpu_composites"] = True
       ret["param_tensor"] = param_tensor
     kv_cache.set_cache_runtime_args(cache_runtime_args)
+    if kwargs.get("sdpa_use_composite", False):
+      ret["sdpa_use_composite"] = kwargs["sdpa_use_composite"]
 
     ret.update({
         "position_ids": input_pos.clone().unsqueeze(0),
@@ -235,6 +239,11 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
   ):
     if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
       kwargs["apply_gpu_composites"] = True
+    if self.export_config.extra_kwargs.get("sdpa_use_composite", False):
+      kwargs["sdpa_use_composite"] = self.export_config.extra_kwargs[
+          "sdpa_use_composite"
+      ]
+      kwargs["apply_gpu_composites"] = True
     inputs = self.adapt_inputs(
         tokens,
         None,
@@ -286,7 +295,9 @@ class LiteRTExportableModuleForDecoderOnlyLMPrefill(
               dtype=torch.bool if use_bool_mask else torch.float32,
           ),
       }
-      if export_config.extra_kwargs.get("apply_gpu_composites", False):
+      if export_config.extra_kwargs.get(
+          "apply_gpu_composites", False
+      ) or export_config.extra_kwargs.get("sdpa_use_composite", False):
         inputs["param_tensor"] = torch.ones((1, 1, 1, 7), dtype=torch.int32)
 
       inputs.update(kv_cache_inputs)
@@ -320,6 +331,11 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
       **kwargs,
   ):
     if self.export_config.extra_kwargs.get("apply_gpu_composites", False):
+      kwargs["apply_gpu_composites"] = True
+    if self.export_config.extra_kwargs.get("sdpa_use_composite", None):
+      kwargs["sdpa_use_composite"] = self.export_config.extra_kwargs[
+          "sdpa_use_composite"
+      ]
       kwargs["apply_gpu_composites"] = True
     inputs = self.adapt_inputs(
         tokens,
@@ -377,7 +393,9 @@ class LiteRTExportableModuleForDecoderOnlyLMGenerate(
             dtype=torch.bool if use_bool_mask else torch.float32,
         ),
     }
-    if export_config.extra_kwargs.get("apply_gpu_composites", False):
+    if export_config.extra_kwargs.get(
+        "apply_gpu_composites", False
+    ) or export_config.extra_kwargs.get("sdpa_use_composite", False):
       inputs["param_tensor"] = torch.ones((1, 1, 1, 7), dtype=torch.int32)
 
     inputs.update(kv_cache_inputs)
