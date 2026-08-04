@@ -256,6 +256,7 @@ def quantize(
     output_path: str | None = None,
     embedder_model_path: str | None = None,
     aux_model_path: str | None = None,
+    aux_output_path: str | None = None,
     ple_model_path: str | None = None,
     spm_path: str | None = None,
     transformers_model_path: str | None = None,
@@ -400,7 +401,6 @@ def quantize(
   print(f'--- Exporting quantized model to: {output_path} ...')
   quantization_result.export_model(output_path, overwrite=True)
 
-  aux_output_path = None
   if aux_model_path and aux_calibration_result:
     print(f'--- Initializing Quantizer for aux model: {aux_model_path} ...')
     q_aux = quantizer.Quantizer(aux_model_path)
@@ -419,11 +419,12 @@ def quantize(
         aux_quantization_result, skip_mlir_passes=skip_mlir_passes
     )
 
-    aux_output_path = (
-        output_litertlm + '.aux_intermediate.tflite'
-        if output_litertlm
-        else aux_model_path + '.quantized.tflite'
-    )
+    if not aux_output_path:
+      aux_output_path = (
+          output_litertlm + '.aux_intermediate.tflite'
+          if output_litertlm
+          else aux_model_path + '.quantized.tflite'
+      )
     aux_output_dir = os.path.dirname(aux_output_path)
     if aux_output_dir and not os.path.exists(aux_output_dir):
       os.makedirs(aux_output_dir, exist_ok=True)
@@ -464,6 +465,7 @@ def main(argv: Sequence[str]) -> None:
       output_path=_OUTPUT_PATH.value,
       embedder_model_path=_EMBEDDER_MODEL_PATH.value,
       aux_model_path=_AUX_MODEL_PATH.value,
+      aux_output_path=_AUX_OUTPUT_PATH.value,
       ple_model_path=_PLE_MODEL_PATH.value,
       spm_path=_SPM_PATH.value,
       transformers_model_path=_TRANSFORMERS_MODEL_PATH.value,
