@@ -255,6 +255,32 @@ class ExportNpuCompilationPipelineTest(absltest.TestCase):
       mock_get_cls.assert_called_once_with("Flux2KleinPipeline")
       mock_model_cls.assert_called_once_with(tmp_dir, export_config=config)
 
+  @mock.patch("litert_torch.generative.export_hf.export.run_export_tasks")
+  def test_text_to_speech_kokoro_export_orchestration(self, mock_run_export):
+    mock_run_export.return_value = mock.MagicMock(
+        litert_lm_model_path=None,
+        additional_model_paths={
+            "kokoro_acoustic": "/tmp/kokoro_acoustic.tflite"
+        },
+    )
+    export.export(
+        model="hexgrad/Kokoro-82M",
+        output_dir="/tmp/fake_kokoro_output",
+        task="text_to_speech",
+        buckets=[48, 64, 96],
+        default_bucket=64,
+        frames_per_token=3,
+    )
+    mock_run_export.assert_called_once()
+    passed_tasks = mock_run_export.call_args[0][0]
+    passed_config = mock_run_export.call_args[0][1]
+    self.assertEqual(passed_config.task, export.ExportTask.TEXT_TO_SPEECH)
+    self.assertFalse(passed_config.bundle_litert_lm)
+    self.assertEqual(passed_config.extra_kwargs["buckets"], [48, 64, 96])
+    self.assertEqual(passed_config.extra_kwargs["default_bucket"], 64)
+    self.assertEqual(passed_config.extra_kwargs["frames_per_token"], 3)
+    self.assertEqual(passed_tasks, [export_lib.export_tts_models])
+
 
 if __name__ == "__main__":
   absltest.main()

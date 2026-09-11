@@ -26,6 +26,7 @@ from litert_torch.generative.export_hf.model_ext.gemma4 import exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import split_cache_exportable_module as gemma4_split_cache_exportable_module
 from litert_torch.generative.export_hf.model_ext.gemma4 import vision_exportable as gemma4_vision_exportable
 from litert_torch.generative.export_hf.model_ext.gemma4_unified import vision_exportable as gemma4_unified_vision_exportable
+from litert_torch.generative.export_hf.model_ext.kokoro_tts import kokoro_tts as kokoro_tts_lib
 from litert_torch.generative.export_hf.model_ext.lfm2_vl import vision_exportable as lfm2_vl_vision_exportable
 from litert_torch.generative.export_hf.model_ext.moonshine import moonshine as moonshine_lib
 from litert_torch.generative.export_hf.model_ext.parakeet import parakeet_ctc as parakeet_ctc_lib
@@ -210,6 +211,8 @@ def get_tts_model_cls(model_type: str):
   """Gets TTS model class by model type."""
   if model_type in ('qwen3_tts', 'qwen3_tts_talker', 'qwen3'):
     return qwen3_tts_lib.Qwen3Tts
+  elif model_type in ('kokoro', 'kokoro_tts', 'kokoro-82m', 'kokoro_82m'):
+    return kokoro_tts_lib.KokoroTts
   else:
     raise ValueError(f'Unsupported TTS model type: {model_type}')
 

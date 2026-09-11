@@ -39,6 +39,13 @@ class ExportTask(str, enum.Enum):
 # `extra_kwargs`. Anything else is rejected so that a mistyped flag fails loudly
 # instead of being silently ignored.
 _KNOWN_EXTRA_KWARGS = frozenset({
+    "buckets",
+    "default_bucket",
+    "export_acoustic",
+    "export_multisig",
+    "export_vocoder",
+    "export_vocoder_buckets",
+    "frames_per_token",
     "gemma4_vision_max_soft_tokens",
     "litert_samples_conversion_dir",
     "max_seq_len",

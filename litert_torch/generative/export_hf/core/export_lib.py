@@ -325,12 +325,27 @@ def load_model(
         dtype=torch.float32,
         trust_remote_code=trust_remote_code,
     )
-  except (KeyError, ValueError):
+  except (KeyError, ValueError, OSError):
     # Fallback to PretrainedConfig if the model architecture is not built into
     # transformers AutoConfig.
-    config_dict, _ = transformers.PretrainedConfig.get_config_dict(
-        model_path, trust_remote_code=trust_remote_code
-    )
+    try:
+      config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+          model_path, trust_remote_code=trust_remote_code
+      )
+    except OSError:
+      if (
+          task == ExportTask.TEXT_TO_SPEECH
+          and 'kokoro' in str(model_path).lower()
+      ):
+        config_dict = {'model_type': 'kokoro'}
+      else:
+        raise
+    if (
+        'istftnet' in config_dict
+        or 'n_token' in config_dict
+        or 'kokoro' in str(model_path).lower()
+    ):
+      config_dict['model_type'] = 'kokoro'
     config = transformers.PretrainedConfig.from_dict(config_dict)
 
   # Opt-in to global access for per-layer config attributes to avoid blocking heterogeneous pipelines
